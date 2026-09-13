@@ -154,8 +154,12 @@ def run_whisper_transcription(media_path, **params):
         return _run_whisper_once(media_path, **params)
 
 
-def _transcribe_with_whisper(media_path):
-    segments, info = run_whisper_transcription(media_path, **WHISPER_TRANSCRIBE_PARAMS)
+def _transcribe_with_whisper(media_path, language=None, whisper_options=None):
+    params = dict(WHISPER_TRANSCRIBE_PARAMS)
+    params.update(whisper_options or {})
+    if language:
+        params["language"] = language
+    segments, info = run_whisper_transcription(media_path, **params)
 
     out_segments = []
     text_parts = []
@@ -350,8 +354,13 @@ def _has_audio_stream(media_path) -> bool:
         return True  # probe failed — don't block, let the backend try
 
 
-def transcribe_media(media_path):
-    """Transcribe with the configured backend, falling back to whisper."""
+def transcribe_media(media_path, language=None, whisper_options=None):
+    """Transcribe with the configured backend, falling back to whisper.
+
+    ``language`` is optional so existing auto-detect callers retain their
+    behavior. Vietnamese Music Reader jobs pass ``vi`` explicitly; Parakeet
+    does not support Vietnamese, so those jobs go directly to Whisper.
+    """
     # Silent videos (AI-generated clips, muted screen recordings) have no audio
     # stream; every ASR backend then crashes deep inside libav with an opaque
     # "tuple index out of range". Detect it up front and fail with a clear,
@@ -363,7 +372,7 @@ def transcribe_media(media_path):
 
     backend = os.environ.get("TRANSCRIBE_BACKEND", "whisper").strip().lower()
 
-    if backend == "parakeet":
+    if backend == "parakeet" and (not language or language in PARAKEET_LANGS):
         try:
             transcript = _transcribe_with_parakeet(media_path)
             reason = _parakeet_fallback_reason(transcript)
@@ -377,4 +386,7 @@ def transcribe_media(media_path):
             print(f"⚠️ [ASR] parakeet failed ({type(e).__name__}: {e}) — "
                   f"falling back to whisper")
 
+    if language or whisper_options:
+        return _transcribe_with_whisper(
+            media_path, language=language, whisper_options=whisper_options)
     return _transcribe_with_whisper(media_path)

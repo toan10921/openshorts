@@ -158,6 +158,24 @@ def test_transcribe_media_default_is_whisper(monkeypatch):
     assert tb.transcribe_media("video.mp4") is sentinel
 
 
+def test_vietnamese_hint_skips_parakeet_and_reaches_whisper(monkeypatch):
+    sentinel = {"text": "xin chào", "language": "vi", "segments": []}
+    seen = {}
+    monkeypatch.setenv("TRANSCRIBE_BACKEND", "parakeet")
+    monkeypatch.setattr(tb, "_has_audio_stream", lambda path: True)
+    monkeypatch.setattr(
+        tb, "_transcribe_with_parakeet",
+        lambda path: (_ for _ in ()).throw(AssertionError("should not run")))
+
+    def whisper(path, language=None, whisper_options=None):
+        seen["language"] = language
+        return sentinel
+
+    monkeypatch.setattr(tb, "_transcribe_with_whisper", whisper)
+    assert tb.transcribe_media("song.wav", language="vi") is sentinel
+    assert seen["language"] == "vi"
+
+
 def test_transcribe_media_raises_on_silent_video(monkeypatch):
     monkeypatch.setattr(tb, "_has_audio_stream", lambda path: False)
     with pytest.raises(tb.NoAudioError):

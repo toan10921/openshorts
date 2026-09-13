@@ -44,6 +44,8 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # Default to 1 if not set, but user can set higher for powerful servers
 MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "5"))
 MAX_FILE_SIZE_MB = 2048  # 2GB limit
+MUSIC_ENABLED = os.environ.get("MUSIC_ENABLED", "true").lower() in ("1", "true", "yes")
+MUSIC_GPU_CONCURRENCY = max(int(os.environ.get("MUSIC_GPU_CONCURRENCY", "1")), 1)
 
 # How TikTok receives our uploads. MEDIA_UPLOAD lands the video in the user's
 # TikTok drafts so they finish the post inside TikTok's own editor; DIRECT_POST
@@ -420,10 +422,13 @@ async def _assert_job_owner(request, record):
 job_queue = asyncio.PriorityQueue()
 _job_seq = itertools.count()
 jobs: Dict[str, Dict] = {}
+music_jobs: Dict[str, Dict] = {}
 thumbnail_sessions: Dict[str, Dict] = {}
 publish_jobs: Dict[str, Dict] = {}  # {publish_id: {status, result, error}}
 # Semester to limit concurrency to MAX_CONCURRENT_JOBS
 concurrency_semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
+music_gpu_semaphore = asyncio.Semaphore(MUSIC_GPU_CONCURRENCY)
+_music_tasks = set()
 
 
 def _enqueue_job(job_id: str, priority: int = 2):
@@ -1589,6 +1594,7 @@ def _purge_local_jobs_for_user(user_id) -> int:
     for job_id in job_ids:
         _rm_under(OUTPUT_DIR, job_id)
         jobs.pop(job_id, None)
+        music_jobs.pop(job_id, None)
         # Source uploads are named "<job_id>_<filename>" (see /api/process).
         for path in glob.glob(os.path.join(UPLOAD_DIR, f"{glob.escape(job_id)}_*")):
             try:
@@ -1627,6 +1633,7 @@ def _purge_local_jobs_for_user(user_id) -> int:
 async def lifespan(app: FastAPI):
     # Rehydrate finished jobs from disk before serving (survives restarts).
     _recover_jobs_from_disk()
+    _recover_music_jobs_from_disk()
     # Re-enqueue jobs that were mid-processing when we stopped (redeploy). Their
     # reservations must survive the orphan sweep so the resumed run can settle them.
     _resumed_reservation_ids = _resume_interrupted_jobs()
@@ -1933,6 +1940,7 @@ async def health_ready():
 async def get_config():
     return {
         "youtubeUrlEnabled": not DISABLE_YOUTUBE_URL,
+        "musicEnabled": MUSIC_ENABLED,
         "billingEnabled": BILLING_ENABLED,
         "googleAuthEnabled": bool(BILLING_ENABLED and cloud.settings.google_auth_enabled),
         "jobRetentionSeconds": JOB_RETENTION_SECONDS,
@@ -2081,7 +2089,7 @@ async def put_upload(upload_id: str, request: Request):
     if duration <= 0:
         os.remove(slot["path"])
         slot["complete"] = False
-        raise HTTPException(status_code=400, detail="The body is not a readable video file")
+        raise HTTPException(status_code=400, detail="The body is not a readable media file")
     return {"upload_id": upload_id, "bytes": size, "duration_seconds": round(duration, 1),
             "hint": "Now call /api/process with upload_id."}
 
@@ -2124,6 +2132,301 @@ def _take_pending_upload(upload_id, user_id):
     if not slot.get("complete") or not os.path.exists(slot["path"]):
         raise HTTPException(status_code=409, detail="Upload not received yet: PUT the video to upload_url first")
     return slot
+
+
+# --------------------------------------------------------------------------- #
+# Music Reader (M1): uploaded media -> Vietnamese transcript -> TXT/JSON/SRT.
+# It has a separate lightweight job runner because the main queue executes the
+# OpenShorts video CLI. Both job families still share uploads, ownership,
+# retention and the process-wide ASR GPU gate in transcribe_backends.py.
+# --------------------------------------------------------------------------- #
+
+class MusicJobRequest(BaseModel):
+    upload_id: str
+    language: str = "vi"
+    separate_vocals: bool = False
+    create_tts: bool = False
+
+
+def _music_job_dir(job_id):
+    if not re.fullmatch(r"music_[0-9a-f]{32}", str(job_id or "")):
+        return None
+    return os.path.join(OUTPUT_DIR, job_id)
+
+
+def _persist_music_job(job_id):
+    from music.storage import atomic_write_json
+
+    record = music_jobs.get(job_id)
+    output_dir = _music_job_dir(job_id)
+    if not record or not output_dir:
+        return
+    public_record = {
+        key: value for key, value in record.items()
+        if key not in {"input_path", "output_dir"}
+    }
+    atomic_write_json(os.path.join(output_dir, "music-job.json"), public_record)
+
+
+def _music_job_from_disk(job_id):
+    output_dir = _music_job_dir(job_id)
+    if not output_dir:
+        return None
+    manifest = os.path.join(output_dir, "music-job.json")
+    try:
+        with open(manifest, encoding="utf-8") as source:
+            record = json.load(source)
+        owner_path = os.path.join(output_dir, ".owner")
+        if os.path.exists(owner_path):
+            with open(owner_path, encoding="utf-8") as source:
+                record["user_id"] = source.read().strip() or None
+        record["output_dir"] = output_dir
+        source_files = glob.glob(os.path.join(output_dir, "source_upload.*"))
+        if source_files:
+            record["input_path"] = source_files[0]
+        return record
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _recover_music_jobs_from_disk():
+    """Restore terminal Music Reader jobs and close interrupted ones cleanly."""
+    try:
+        names = os.listdir(OUTPUT_DIR)
+    except OSError:
+        return
+    for job_id in names:
+        if not str(job_id).startswith("music_"):
+            continue
+        record = _music_job_from_disk(job_id)
+        if not record:
+            continue
+        if record.get("status") in {"queued", "running"}:
+            record.update(
+                status="failed",
+                stage="failed",
+                error="Backend restarted while this job was processing. Please submit it again.",
+            )
+        music_jobs[job_id] = record
+        _persist_music_job(job_id)
+
+
+def _music_job_public_view(job_id, record):
+    result = record.get("result")
+    if result and result.get("artifacts"):
+        result = dict(result)
+        result["artifacts"] = {
+            kind: f"/api/music/jobs/{job_id}/artifacts/{filename}"
+            for kind, filename in result["artifacts"].items()
+        }
+        result["download"] = f"/api/music/jobs/{job_id}/download"
+    return {
+        "id": job_id,
+        "type": "music",
+        "status": record.get("status"),
+        "stage": record.get("stage"),
+        "progress": record.get("progress", 0),
+        "source": record.get("source"),
+        "options": record.get("options"),
+        "result": result,
+        "error": record.get("error"),
+        "created_at": record.get("created_at"),
+    }
+
+
+async def _run_music_job(job_id):
+    record = music_jobs.get(job_id)
+    if not record:
+        return
+    async with music_gpu_semaphore:
+        record.update(status="running", stage="validate", progress=1)
+        _persist_music_job(job_id)
+
+        def on_progress(stage, percent):
+            current = music_jobs.get(job_id)
+            if not current:
+                return
+            current.update(stage=stage, progress=int(percent))
+            _persist_music_job(job_id)
+
+        try:
+            from music.jobs import MusicJobOptions, process_music_job
+
+            options = MusicJobOptions(**record["options"])
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(
+                None,
+                functools.partial(
+                    process_music_job,
+                    record["input_path"],
+                    record["output_dir"],
+                    options,
+                    on_progress,
+                ),
+            )
+            record.update(
+                status="completed", stage="complete", progress=100,
+                result=result, error=None,
+            )
+        except Exception as exc:
+            print(f"❌ Music job {job_id} failed: {type(exc).__name__}: {exc}")
+            record.update(
+                status="failed", stage="failed",
+                error=str(exc) or type(exc).__name__,
+            )
+        _persist_music_job(job_id)
+
+
+def _schedule_music_job(job_id):
+    task = asyncio.create_task(_run_music_job(job_id))
+    _music_tasks.add(task)
+    task.add_done_callback(_music_tasks.discard)
+
+
+@app.post("/api/music/jobs")
+async def create_music_job(payload: MusicJobRequest, request: Request):
+    if not MUSIC_ENABLED:
+        raise HTTPException(status_code=404, detail="Music Reader is disabled")
+    await require_managed_entitlement(request)
+    if payload.language != "vi":
+        raise HTTPException(status_code=400, detail="M1 only supports Vietnamese (vi)")
+    if payload.separate_vocals:
+        raise HTTPException(status_code=400, detail="Vocal separation is planned for M2")
+    if payload.create_tts:
+        raise HTTPException(status_code=400, detail="Vietnamese TTS is planned for M3")
+
+    user_id = await _owner_id(request)
+    slot = _take_pending_upload(payload.upload_id, user_id)
+    job_id = f"music_{uuid.uuid4().hex}"
+    output_dir = _music_job_dir(job_id)
+    os.makedirs(output_dir, exist_ok=False)
+
+    original_name = os.path.basename(slot.get("filename") or "audio") or "audio"
+    suffix = os.path.splitext(original_name)[1].lower()
+    if not re.fullmatch(r"\.[a-z0-9]{1,8}", suffix):
+        suffix = ".media"
+    input_path = os.path.join(output_dir, f"source_upload{suffix}")
+    try:
+        # uploads/ and output/ may be different Docker volumes. os.replace()
+        # fails with EXDEV across filesystems; shutil.move() keeps the cheap
+        # rename on one filesystem and transparently copies+removes otherwise.
+        shutil.move(slot["path"], input_path)
+        pending_uploads.pop(payload.upload_id, None)
+        record = {
+            "status": "queued",
+            "stage": "queued",
+            "progress": 0,
+            "source": {"kind": "upload", "filename": original_name},
+            "options": {
+                "language": payload.language,
+                "separate_vocals": payload.separate_vocals,
+                "create_tts": payload.create_tts,
+            },
+            "result": None,
+            "error": None,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "user_id": user_id,
+            "input_path": input_path,
+            "output_dir": output_dir,
+        }
+        music_jobs[job_id] = record
+        if user_id is not None:
+            with open(os.path.join(output_dir, ".owner"), "w", encoding="utf-8") as owner:
+                owner.write(str(user_id))
+        _persist_music_job(job_id)
+        _schedule_music_job(job_id)
+    except Exception:
+        music_jobs.pop(job_id, None)
+        shutil.rmtree(output_dir, ignore_errors=True)
+        raise
+    return _music_job_public_view(job_id, record)
+
+
+@app.get("/api/music/jobs/{job_id}")
+async def get_music_job(job_id: str, request: Request):
+    record = music_jobs.get(job_id) or _music_job_from_disk(job_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Music job not found")
+    await _assert_job_owner(request, record)
+    return _music_job_public_view(job_id, record)
+
+
+@app.post("/api/music/jobs/{job_id}/retry")
+async def retry_music_job(job_id: str, request: Request):
+    record = music_jobs.get(job_id) or _music_job_from_disk(job_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Music job not found")
+    await _assert_job_owner(request, record)
+    if record.get("status") in {"queued", "running"}:
+        raise HTTPException(status_code=409, detail="Music job is already running")
+    if not record.get("input_path") or not os.path.isfile(record["input_path"]):
+        raise HTTPException(status_code=409, detail="The original uploaded media is no longer available")
+    music_jobs[job_id] = record
+    record.update(
+        status="queued", stage="queued", progress=0, result=None, error=None,
+    )
+    _persist_music_job(job_id)
+    _schedule_music_job(job_id)
+    return _music_job_public_view(job_id, record)
+
+
+@app.get("/api/music/jobs/{job_id}/artifacts/{name}")
+async def get_music_artifact(job_id: str, name: str, request: Request):
+    from music.storage import artifact_path
+
+    record = music_jobs.get(job_id) or _music_job_from_disk(job_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Music job not found")
+    await _assert_job_owner(request, record)
+    try:
+        path = artifact_path(record["output_dir"], name)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    if record.get("status") != "completed" or not path.is_file():
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    media_types = {
+        ".json": "application/json",
+        ".txt": "text/plain; charset=utf-8",
+        ".srt": "application/x-subrip; charset=utf-8",
+    }
+    return FileResponse(path, media_type=media_types.get(path.suffix), filename=path.name)
+
+
+@app.get("/api/music/jobs/{job_id}/download")
+async def download_music_job(job_id: str, request: Request):
+    from music.storage import artifact_path
+
+    record = music_jobs.get(job_id) or _music_job_from_disk(job_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Music job not found")
+    await _assert_job_owner(request, record)
+    if record.get("status") != "completed":
+        raise HTTPException(status_code=409, detail="Music job is not complete")
+    archive = os.path.join(record["output_dir"], "music-reader-results.zip")
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
+        for filename in (record.get("result") or {}).get("artifacts", {}).values():
+            try:
+                path = artifact_path(record["output_dir"], filename)
+            except ValueError:
+                continue
+            if path.is_file():
+                bundle.write(path, arcname=path.name)
+    return FileResponse(archive, media_type="application/zip", filename="music-reader-results.zip")
+
+
+@app.delete("/api/music/jobs/{job_id}")
+async def delete_music_job(job_id: str, request: Request):
+    record = music_jobs.get(job_id) or _music_job_from_disk(job_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Music job not found")
+    await _assert_job_owner(request, record)
+    if record.get("status") in {"queued", "running"}:
+        raise HTTPException(status_code=409, detail="Cannot delete a running music job")
+    output_dir = _music_job_dir(job_id)
+    music_jobs.pop(job_id, None)
+    if output_dir:
+        shutil.rmtree(output_dir, ignore_errors=True)
+    return {"deleted": job_id}
 
 
 def layout_env(requested):

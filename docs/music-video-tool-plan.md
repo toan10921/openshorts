@@ -1,5 +1,16 @@
 # Kế hoạch triển khai Music Reader & Video Continuity
 
+## Trạng thái triển khai
+
+- **M1 đã có code nền (2026-09-14):** upload qua `upload_id`, job nền có
+  progress/manifest, ép ASR tiếng Việt, chuẩn hóa FFmpeg, xuất TXT/JSON/SRT,
+  download ZIP, ownership/retention và tab Music Reader trên dashboard.
+- **Đã kiểm thử:** unit/API/regression backend và production build dashboard.
+- **Còn lại trong M1:** benchmark transcription thật trên RTX 3060 bằng bộ file
+  mẫu tiếng Việt và tinh chỉnh preset theo VRAM 6 GB hoặc 12 GB.
+- **Chưa triển khai:** Demucs/LRC/editor (M2), TTS (M3) và Video Continuity
+  (M4–M5).
+
 ## 1. Mục tiêu và cách hiểu yêu cầu
 
 Tính năng mới có hai năng lực độc lập nhưng dùng chung hạ tầng media của
