@@ -4,6 +4,14 @@ services:
     container_name: openshorts-backend
     ports:
       - "8000:8000"
+    # Bind-mount hides the image's /app (incl. baked yolov8n.pt) and is owned by
+    # the host user, so appuser (uid 999) cannot write caches there. Point
+    # caches at /tmp and keep a host-side yolov8n.pt (gitignored) for YOLO.
+    environment:
+      - YOLO_MODEL_PATH=/app/yolov8n.pt
+      - MPLCONFIGDIR=/tmp/matplotlib
+      - XDG_CACHE_HOME=/tmp/xdg-cache
+      - HOME=/tmp
     volumes:
       - .:/app
       - /app/__pycache__

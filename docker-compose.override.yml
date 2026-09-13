@@ -1,0 +1,20 @@
+# Local GPU + host Ollama override (auto-merged by `docker compose up`).
+# Requires NVIDIA driver + NVIDIA Container Toolkit on the host.
+# See README § "GPU acceleration" / "Run without a Google key".
+services:
+  backend:
+    build:
+      context: .
+      args:
+        GPU: "1"
+    # Linux: resolve host.docker.internal to the docker bridge gateway so the
+    # container can reach Ollama on the host (OLLAMA_HOST must not be 127.0.0.1-only).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, video]
