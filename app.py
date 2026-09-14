@@ -2153,10 +2153,23 @@ class MusicSearchRequest(BaseModel):
     top_k: int = 5
 
 
+class MusicExcerptRequest(BaseModel):
+    match_start: float
+    match_end: float
+    query: Optional[str] = None
+    matched_text: Optional[str] = None
+    match_score: Optional[float] = None
+    excerpt_seconds: float = 10.0
+    tail_padding: float = 0.15
+
+
 class MusicOverlayRequest(BaseModel):
     music_job_id: str
-    video_job_id: str
-    clip_index: int
+    video_source: str = "openshort"
+    video_job_id: Optional[str] = None
+    clip_index: int = 0
+    video_upload_id: Optional[str] = None
+    video_acknowledged: bool = False
     start: float
     end: float
     query: Optional[str] = None
@@ -2166,6 +2179,9 @@ class MusicOverlayRequest(BaseModel):
     music_volume: float = 0.9
     original_volume: float = 0.2
     fade_seconds: float = 0.08
+    lead_seconds: float = 10.0
+    tail_padding: float = 0.15
+    lyric_captions: bool = True
 
 
 def _music_job_dir(job_id):
@@ -2477,6 +2493,78 @@ async def preview_music_selection(job_id: str, request: Request, start: float,
     return FileResponse(output_path, media_type="audio/mpeg", filename="music-preview.mp3")
 
 
+@app.post("/api/music/jobs/{job_id}/excerpt")
+async def export_music_excerpt(job_id: str, payload: MusicExcerptRequest, request: Request):
+    from music.compose import render_lyric_excerpt
+    from music.storage import atomic_write_json
+
+    record = music_jobs.get(job_id) or _music_job_from_disk(job_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Music job not found")
+    await _assert_job_owner(request, record)
+    if record.get("status") != "completed":
+        raise HTTPException(status_code=409, detail="Music job is not complete")
+    values = [payload.match_start, payload.match_end, payload.excerpt_seconds,
+              payload.tail_padding]
+    if not all(math.isfinite(value) for value in values):
+        raise HTTPException(status_code=400, detail="Excerpt settings must be finite numbers")
+    if payload.match_start < 0 or payload.match_end <= payload.match_start:
+        raise HTTPException(status_code=400, detail="Matched timestamp is invalid")
+    if not 1 <= payload.excerpt_seconds <= 30:
+        raise HTTPException(status_code=400, detail="Excerpt must be between 1 and 30 seconds")
+    if not 0 <= payload.tail_padding <= 1:
+        raise HTTPException(status_code=400, detail="Tail padding must be between 0 and 1 second")
+    if payload.match_score is not None and not math.isfinite(payload.match_score):
+        raise HTTPException(status_code=400, detail="Match score must be a finite number")
+
+    music_path = _music_source(record)
+    metadata = _music_source_metadata(record)
+    try:
+        source_duration = float(metadata.get("duration") or 0)
+    except (TypeError, ValueError):
+        source_duration = 0
+    if not music_path or source_duration <= 0:
+        raise HTTPException(status_code=409, detail="The original music file is no longer available")
+    if payload.match_end > source_duration:
+        raise HTTPException(status_code=400, detail="Matched timestamp exceeds the source duration")
+
+    token = uuid.uuid4().hex[:12]
+    output_filename = f"lyric_excerpt_{token}.wav"
+    plan_filename = f"lyric_excerpt_{token}.json"
+    output_path = os.path.join(record["output_dir"], output_filename)
+    try:
+        details = await asyncio.get_running_loop().run_in_executor(
+            None,
+            functools.partial(
+                render_lyric_excerpt,
+                music_path, output_path, payload.match_end, source_duration,
+                payload.excerpt_seconds, payload.tail_padding,
+            ),
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    plan = {
+        "version": 1,
+        "music_job_id": job_id,
+        "source_sha256": metadata.get("sha256"),
+        "query": payload.query,
+        "matched_text": payload.matched_text,
+        "match_score": payload.match_score,
+        "match_start": payload.match_start,
+        "match_end": payload.match_end,
+        "excerpt": details,
+        "output": output_filename,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    atomic_write_json(os.path.join(record["output_dir"], plan_filename), plan)
+    return {
+        "audio_url": f"/videos/{job_id}/{output_filename}",
+        "plan_url": f"/videos/{job_id}/{plan_filename}",
+        "plan": plan,
+    }
+
+
 def _short_clip_path(job_id, job, clip_index):
     clips = ((job or {}).get("result") or {}).get("clips") or []
     if clip_index < 0 or clip_index >= len(clips):
@@ -2494,30 +2582,29 @@ def _short_clip_path(job_id, job, clip_index):
 
 @app.post("/api/music/overlay")
 async def overlay_music_on_short(payload: MusicOverlayRequest, request: Request):
-    from music.compose import render_intro_overlay
+    from music.compose import media_has_video, render_music_excerpt_join
     from music.storage import atomic_write_json
 
     music_record = music_jobs.get(payload.music_job_id) or _music_job_from_disk(payload.music_job_id)
     if not music_record:
         raise HTTPException(status_code=404, detail="Music job not found")
     await _assert_job_owner(request, music_record)
-    short_job = _job_record(payload.video_job_id)
-    if not short_job:
-        raise HTTPException(status_code=404, detail="OpenShorts job not found")
-    await _assert_job_owner(request, short_job)
-    if short_job.get("status") != "completed":
-        raise HTTPException(status_code=409, detail="OpenShorts job is not completed")
+    if payload.video_source not in {"openshort", "upload"}:
+        raise HTTPException(status_code=400, detail="video_source must be openshort or upload")
 
-    if payload.mode not in {"mix", "replace"}:
-        raise HTTPException(status_code=400, detail="mode must be mix or replace")
     numeric_values = [payload.start, payload.end, payload.original_volume,
-                      payload.music_volume, payload.fade_seconds]
+                      payload.music_volume, payload.fade_seconds, payload.lead_seconds,
+                      payload.tail_padding]
     if not all(math.isfinite(value) for value in numeric_values):
         raise HTTPException(status_code=400, detail="Audio settings must be finite numbers")
     if not 0 <= payload.original_volume <= 1 or not 0 <= payload.music_volume <= 2:
         raise HTTPException(status_code=400, detail="Invalid audio volume")
     if not 0 <= payload.fade_seconds <= 1:
         raise HTTPException(status_code=400, detail="Invalid fade duration")
+    if not 1 <= payload.lead_seconds <= 30:
+        raise HTTPException(status_code=400, detail="Lead-in must be between 1 and 30 seconds")
+    if not 0 <= payload.tail_padding <= 1:
+        raise HTTPException(status_code=400, detail="Tail padding must be between 0 and 1 second")
     if payload.start < 0 or payload.end <= payload.start or payload.end - payload.start > 30:
         raise HTTPException(status_code=400, detail="Music selection must be between 0 and 30 seconds")
 
@@ -2534,24 +2621,119 @@ async def overlay_music_on_short(payload: MusicOverlayRequest, request: Request)
         raise HTTPException(status_code=400, detail="Match score must be a finite number")
 
     music_path = _music_source(music_record)
-    video_path, clip = _short_clip_path(payload.video_job_id, short_job, payload.clip_index)
     if not music_path:
         raise HTTPException(status_code=409, detail="The original music file is no longer available")
-    if not video_path:
-        raise HTTPException(status_code=409, detail="The selected Short is no longer available")
 
     token = uuid.uuid4().hex[:12]
-    output_dir = os.path.join(OUTPUT_DIR, payload.video_job_id)
-    output_filename = f"music_overlay_{token}_{os.path.basename(video_path)}"
+    clip = None
+    if payload.video_source == "openshort":
+        if not payload.video_job_id:
+            raise HTTPException(status_code=400, detail="video_job_id is required")
+        short_job = _job_record(payload.video_job_id)
+        if not short_job:
+            raise HTTPException(status_code=404, detail="OpenShorts job not found")
+        await _assert_job_owner(request, short_job)
+        if short_job.get("status") != "completed":
+            raise HTTPException(status_code=409, detail="OpenShorts job is not completed")
+        video_path, clip = _short_clip_path(payload.video_job_id, short_job, payload.clip_index)
+        if not video_path:
+            raise HTTPException(status_code=409, detail="The selected Short is no longer available")
+        output_dir = os.path.join(OUTPUT_DIR, payload.video_job_id)
+        video_plan = {
+            "source": "openshort",
+            "job_id": payload.video_job_id,
+            "clip_index": payload.clip_index,
+            "source_file": os.path.basename(video_path),
+            "title": (clip or {}).get("video_title_for_youtube_short"),
+        }
+    else:
+        if not payload.video_acknowledged:
+            raise HTTPException(status_code=400, detail="Confirm that you may process this video")
+        user_id = await _owner_id(request)
+        slot = _take_pending_upload(payload.video_upload_id, user_id)
+        has_video = await asyncio.get_running_loop().run_in_executor(
+            None, media_has_video, slot["path"])
+        if not has_video:
+            raise HTTPException(status_code=400, detail="The uploaded media does not contain a video stream")
+        original_name = os.path.basename(slot.get("filename") or "video.mp4") or "video.mp4"
+        suffix = os.path.splitext(original_name)[1].lower()
+        if not re.fullmatch(r"\.[a-z0-9]{1,8}", suffix):
+            suffix = ".media"
+        output_dir = music_record["output_dir"]
+        video_path = os.path.join(output_dir, f"external_video_{token}{suffix}")
+        try:
+            shutil.move(slot["path"], video_path)
+            pending_uploads.pop(payload.video_upload_id, None)
+        except Exception:
+            try:
+                if os.path.exists(video_path) and not os.path.exists(slot["path"]):
+                    shutil.move(video_path, slot["path"])
+            except OSError:
+                pass
+            raise
+        video_plan = {
+            "source": "upload",
+            "job_id": None,
+            "clip_index": None,
+            "source_file": os.path.basename(video_path),
+            "original_filename": original_name,
+            "title": original_name,
+        }
+
+    output_filename = f"music_leadin_{token}.mp4"
     output_path = os.path.join(output_dir, output_filename)
+    caption_plan = {"enabled": False, "words": [], "ass_url": None, "srt_url": None}
+    subtitle_path = None
+    if payload.lyric_captions:
+        from music.captions import excerpt_caption_words
+        from subtitles import AUTO_CAPTION_STYLE, generate_ass, generate_srt
+
+        transcript_path = os.path.join(music_record["output_dir"], "transcript.json")
+        try:
+            with open(transcript_path, encoding="utf-8") as source:
+                transcript = json.load(source)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=409, detail="Music transcript is not available") from exc
+        excerpt_end = min(music_duration, payload.end + payload.tail_padding)
+        excerpt_start = max(0.0, excerpt_end - payload.lead_seconds)
+        caption_end = min(music_duration, payload.end)
+        ass_filename = f"lyric_intro_{token}.ass"
+        srt_filename = f"lyric_intro_{token}.srt"
+        subtitle_path = os.path.join(output_dir, ass_filename)
+        srt_path = os.path.join(output_dir, srt_filename)
+        style = AUTO_CAPTION_STYLE
+        made_ass = generate_ass(
+            transcript, excerpt_start, caption_end, subtitle_path,
+            max_chars=style["max_chars"], max_duration=style["max_duration"],
+            alignment=style["alignment"], fontsize=style["font_size"],
+            font_name=style["font_name"], font_color=style["font_color"],
+            border_color=style["border_color"], border_width=style["border_width"],
+            highlight_color=style["highlight_color"], effect=style["effect"],
+            base_opacity=style["base_opacity"], uppercase=style["uppercase"],
+        )
+        made_srt = generate_srt(
+            transcript, excerpt_start, caption_end, srt_path,
+            max_chars=style["max_chars"], max_duration=style["max_duration"],
+        )
+        if not made_ass:
+            subtitle_path = None
+        output_job_id = os.path.basename(output_dir)
+        caption_plan = {
+            "enabled": bool(made_ass),
+            "style": "openshorts_karaoke",
+            "words": excerpt_caption_words(transcript, excerpt_start, caption_end),
+            "ass_url": f"/videos/{output_job_id}/{ass_filename}" if made_ass else None,
+            "srt_url": f"/videos/{output_job_id}/{srt_filename}" if made_srt else None,
+        }
     try:
         details = await asyncio.get_running_loop().run_in_executor(
             None,
             functools.partial(
-                render_intro_overlay,
+                render_music_excerpt_join,
                 video_path, music_path, output_path,
-                payload.start, payload.end, payload.mode,
-                payload.music_volume, payload.original_volume, payload.fade_seconds,
+                payload.end, music_duration, payload.lead_seconds,
+                payload.tail_padding, payload.music_volume, payload.fade_seconds,
+                subtitle_path,
             ),
         )
     except Exception as exc:
@@ -2568,27 +2750,25 @@ async def overlay_music_on_short(payload: MusicOverlayRequest, request: Request)
             "start": payload.start,
             "end": payload.end,
         },
-        "video": {
-            "job_id": payload.video_job_id,
-            "clip_index": payload.clip_index,
-            "source_file": os.path.basename(video_path),
-            "title": (clip or {}).get("video_title_for_youtube_short"),
-        },
-        "mix": {
-            "mode": payload.mode,
+        "video": video_plan,
+        "compose": {
+            "placement": "prepend",
+            "lead_seconds_requested": payload.lead_seconds,
+            "tail_padding": payload.tail_padding,
             "music_volume": payload.music_volume,
-            "original_volume": payload.original_volume,
             "fade_seconds": payload.fade_seconds,
         },
+        "captions": caption_plan,
         "render": details,
         "output": output_filename,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
-    plan_filename = f"music_overlay_{token}.json"
+    plan_filename = f"music_leadin_{token}.json"
     atomic_write_json(os.path.join(output_dir, plan_filename), plan)
+    output_job_id = os.path.basename(output_dir)
     return {
-        "video_url": f"/videos/{payload.video_job_id}/{output_filename}",
-        "plan_url": f"/videos/{payload.video_job_id}/{plan_filename}",
+        "video_url": f"/videos/{output_job_id}/{output_filename}",
+        "plan_url": f"/videos/{output_job_id}/{plan_filename}",
         "plan": plan,
     }
 

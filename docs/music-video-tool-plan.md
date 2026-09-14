@@ -6,10 +6,16 @@
   progress/manifest, ép ASR tiếng Việt, chuẩn hóa FFmpeg, xuất TXT/JSON/SRT,
   download ZIP, ownership/retention và tab Music Reader trên dashboard.
 - **Đã kiểm thử:** unit/API/regression backend và production build dashboard.
-- **Cầu nối Music → Short đã có code (2026-09-14):** tìm một câu lyric không
-  phụ thuộc dấu tiếng Việt, xếp hạng các timestamp gần đúng, nghe preview và
-  ghép đoạn nhạc được chọn vào đầu một output OpenShorts theo chế độ mix/duck
-  hoặc replace. File Short gốc không bị ghi đè; mỗi render có JSON plan.
+- **Lyric excerpt đã có code (2026-09-14):** tìm câu không phụ thuộc dấu tiếng
+  Việt, xếp hạng timestamp và nghe preview. Từ candidate đã chọn, xuất WAV tối
+  đa 10 giây kết thúc 150 ms sau `candidate.end`; nhờ vậy giữ trọn chữ cuối và
+  người dùng tự nối với clip trong phần mềm dựng. Mỗi lần xuất có JSON plan.
+- **Ghép video vẫn là lựa chọn song song:** dùng đúng range của WAV ở trên rồi
+  nối với Existing OpenShort (mặc định) hoặc video upload thủ công. Vì hai hành
+  động dùng chung `candidate.end + 150 ms`, preview/export/render không lệch mốc.
+- **Caption phần nhạc đã có code:** mặc định burn karaoke caption theo preset
+  OpenShorts chỉ trong đoạn intro; word timestamp được rebase về 0. Render plan
+  giữ danh sách word và URL tải ASS/SRT để tiếp tục chỉnh sửa bên ngoài.
 - **Còn lại trong M1:** benchmark transcription thật trên RTX 3060 bằng bộ file
   mẫu tiếng Việt và tinh chỉnh preset theo VRAM 6 GB hoặc 12 GB.
 - **Chưa triển khai:** Demucs/LRC/editor (M2), TTS (M3) và Video Continuity
@@ -195,7 +201,8 @@ Các endpoint cần xác thực/chủ sở hữu giống endpoint job hiện t�
 | `GET /api/music/jobs/{id}` | Poll trạng thái, progress và artifact URLs |
 | `POST /api/music/jobs/{id}/search` | Tìm các timestamp của một câu lyric, fuzzy match theo word timestamp |
 | `GET /api/music/jobs/{id}/preview` | Render audio preview tối đa 30 giây quanh candidate |
-| `POST /api/music/overlay` | Ghép candidate vào đầu một clip OpenShorts và lưu render plan |
+| `POST /api/music/jobs/{id}/excerpt` | Xuất WAV 10 giây giữ trọn chữ cuối và 150 ms âm đuôi |
+| `POST /api/music/overlay` | Thêm 10 giây nhạc trước candidate vào OpenShorts và lưu render plan |
 | `GET /api/music/jobs/{id}/lyrics` | Đọc lyric manifest |
 | `PUT /api/music/jobs/{id}/lyrics` | Lưu toàn bộ lyric đã sửa, validate version |
 | `POST /api/music/jobs/{id}/exports` | Tạo lại `txt`, `srt`, `lrc`, hoặc `tts` từ lyric hiện hành |

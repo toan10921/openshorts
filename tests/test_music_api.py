@@ -250,9 +250,55 @@ def test_preview_uses_original_music_and_bounds_selection(music_dirs, monkeypatc
     assert too_long.status_code == 400
 
 
+def test_export_excerpt_uses_match_end_and_preserves_tail(music_dirs, monkeypatch):
+    _, outputs, _ = music_dirs
+    job_id, output = _completed_music(outputs, "7")
+    seen = {}
+
+    def render(source, target, match_end, source_duration, excerpt_seconds, tail_padding):
+        seen.update(
+            source=source, match_end=match_end, source_duration=source_duration,
+            excerpt_seconds=excerpt_seconds, tail_padding=tail_padding,
+        )
+        with open(target, "wb") as destination:
+            destination.write(b"wav")
+        return {
+            "start": 53.67, "match_end": 63.52, "end": 63.67,
+            "duration": 10.0, "tail_padding": 0.15,
+        }
+
+    monkeypatch.setattr("music.compose.render_lyric_excerpt", render)
+    response = _request("POST", f"/api/music/jobs/{job_id}/excerpt", json={
+        "match_start": 60.82,
+        "match_end": 63.52,
+        "query": "hạnh phúc anh xây",
+        "matched_text": "Hạnh phúc anh say",
+        "match_score": 0.88,
+        "excerpt_seconds": 10,
+        "tail_padding": 0.15,
+    })
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["audio_url"].startswith(f"/videos/{job_id}/lyric_excerpt_")
+    assert (output / os.path.basename(payload["audio_url"])).read_bytes() == b"wav"
+    assert seen["match_end"] == 63.52
+    assert seen["excerpt_seconds"] == 10
+    assert seen["tail_padding"] == 0.15
+    assert payload["plan"]["excerpt"]["end"] == 63.67
+    assert (output / os.path.basename(payload["plan_url"])).is_file()
+
+
 def test_overlay_creates_new_video_and_reproducible_plan(music_dirs, monkeypatch):
     _, outputs, _ = music_dirs
-    music_job_id, _ = _completed_music(outputs, "1")
+    music_job_id, music_output = _completed_music(outputs, "1")
+    (music_output / "transcript.json").write_text(json.dumps({
+        "segments": [{"words": [
+            {"word": " Xin", "start": 10.0, "end": 10.4},
+            {"word": " chào", "start": 10.4, "end": 10.9},
+            {"word": " bạn", "start": 10.9, "end": 11.4},
+            {"word": " Next", "start": 13.0, "end": 13.4},
+        ]}],
+    }), encoding="utf-8")
     video_job_id = "video-job"
     video_output = outputs / video_job_id
     video_output.mkdir()
@@ -270,11 +316,13 @@ def test_overlay_creates_new_video_and_reproducible_plan(music_dirs, monkeypatch
     def render(video_path, music_path, output_path, *args):
         assert video_path == str(video)
         assert music_path.endswith("source_upload.mp3")
+        assert args[-1].endswith(".ass")
+        assert os.path.isfile(args[-1])
         with open(output_path, "wb") as target:
             target.write(b"rendered")
         return {"video_duration": 30, "excerpt_duration": 3, "has_original_audio": True}
 
-    monkeypatch.setattr("music.compose.render_intro_overlay", render)
+    monkeypatch.setattr("music.compose.render_music_excerpt_join", render)
     response = _request("POST", "/api/music/overlay", json={
         "music_job_id": music_job_id,
         "video_job_id": video_job_id,
@@ -284,14 +332,77 @@ def test_overlay_creates_new_video_and_reproducible_plan(music_dirs, monkeypatch
         "query": "xin đừng rời xa anh",
         "matched_text": "Xin đừng rời xa anh",
         "match_score": 0.95,
-        "mode": "mix",
+        "lead_seconds": 10,
     })
     assert response.status_code == 200, response.text
     payload = response.json()
-    assert payload["video_url"].startswith(f"/videos/{video_job_id}/music_overlay_")
+    assert payload["video_url"].startswith(f"/videos/{video_job_id}/music_leadin_")
     assert (video_output / os.path.basename(payload["video_url"])).read_bytes() == b"rendered"
     plan = payload["plan"]
     assert plan["music"]["start"] == 10
     assert plan["video"]["source_file"] == "clip.mp4"
-    assert plan["mix"]["mode"] == "mix"
+    assert plan["compose"]["placement"] == "prepend"
+    assert plan["compose"]["lead_seconds_requested"] == 10
+    assert plan["compose"]["tail_padding"] == 0.15
+    assert plan["captions"]["enabled"] is True
+    assert plan["captions"]["style"] == "openshorts_karaoke"
+    assert plan["captions"]["words"]
+    assert all(word["text"] != "Next" for word in plan["captions"]["words"])
+    assert (video_output / os.path.basename(plan["captions"]["ass_url"])).is_file()
+    assert (video_output / os.path.basename(plan["captions"]["srt_url"])).is_file()
     assert (video_output / os.path.basename(payload["plan_url"])).is_file()
+
+
+def test_overlay_accepts_manually_uploaded_video(music_dirs, monkeypatch):
+    uploads, outputs, _ = music_dirs
+    music_job_id, music_output = _completed_music(outputs, "2")
+    upload_id, upload_path = _completed_slot(uploads, "outside-video.mov")
+    monkeypatch.setattr("music.compose.media_has_video", lambda path: path == str(upload_path))
+
+    def render(video_path, music_path, output_path, *args):
+        assert os.path.basename(video_path).startswith("external_video_")
+        assert video_path.endswith(".mov")
+        assert music_path.endswith("source_upload.mp3")
+        with open(output_path, "wb") as target:
+            target.write(b"external-render")
+        return {"video_duration": 20, "lead_duration": 10, "output_duration": 30}
+
+    monkeypatch.setattr("music.compose.render_music_excerpt_join", render)
+    response = _request("POST", "/api/music/overlay", json={
+        "music_job_id": music_job_id,
+        "video_source": "upload",
+        "video_upload_id": upload_id,
+        "video_acknowledged": True,
+        "start": 60,
+        "end": 63,
+        "query": "câu đầu video",
+        "matched_text": "Câu đầu video",
+        "lead_seconds": 10,
+        "lyric_captions": False,
+    })
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["video_url"].startswith(f"/videos/{music_job_id}/music_leadin_")
+    assert payload["plan"]["video"]["source"] == "upload"
+    assert payload["plan"]["video"]["original_filename"] == "outside-video.mov"
+    assert upload_id not in app_module.pending_uploads
+    assert not upload_path.exists()
+    assert list(music_output.glob("external_video_*.mov"))
+    assert (music_output / os.path.basename(payload["video_url"])).read_bytes() == b"external-render"
+
+
+def test_manual_video_requires_rights_confirmation(music_dirs):
+    uploads, outputs, _ = music_dirs
+    music_job_id, _ = _completed_music(outputs, "3")
+    upload_id, _ = _completed_slot(uploads, "outside-video.mp4")
+    response = _request("POST", "/api/music/overlay", json={
+        "music_job_id": music_job_id,
+        "video_source": "upload",
+        "video_upload_id": upload_id,
+        "video_acknowledged": False,
+        "start": 60,
+        "end": 63,
+    })
+    assert response.status_code == 400
+    assert "Confirm" in response.text
+    assert upload_id in app_module.pending_uploads

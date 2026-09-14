@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Download, FileAudio, Loader2, Music2, Play, RotateCcw, Search, Sparkles, Upload, X } from 'lucide-react';
+import { Download, FileAudio, Film, Loader2, Music2, Play, RotateCcw, Scissors, Search, Sparkles, Upload, X } from 'lucide-react';
 import { apiFetch, apiJson } from '../lib/api';
 import { getApiUrl } from '../config';
 
@@ -29,10 +29,15 @@ export default function MusicReader({ shortJobId = null, shortClips = [] }) {
   const [hasSearched, setHasSearched] = useState(false);
   const [previewUrl, setPreviewUrl] = useState('');
   const [previewing, setPreviewing] = useState(false);
+  const [extracting, setExtracting] = useState(false);
+  const [excerptResult, setExcerptResult] = useState(null);
+  const [videoSource, setVideoSource] = useState('openshort');
   const [clipIndex, setClipIndex] = useState(0);
-  const [overlayMode, setOverlayMode] = useState('mix');
-  const [rendering, setRendering] = useState(false);
-  const [overlayResult, setOverlayResult] = useState(null);
+  const [externalVideo, setExternalVideo] = useState(null);
+  const [videoConfirmed, setVideoConfirmed] = useState(false);
+  const [lyricCaptions, setLyricCaptions] = useState(true);
+  const [joining, setJoining] = useState(false);
+  const [joinResult, setJoinResult] = useState(null);
   const pollTimer = useRef(null);
 
   useEffect(() => () => clearTimeout(pollTimer.current), []);
@@ -150,7 +155,8 @@ export default function MusicReader({ shortJobId = null, shortClips = [] }) {
     setSelected(null);
     setCandidates([]);
     setHasSearched(false);
-    setOverlayResult(null);
+    setExcerptResult(null);
+    setJoinResult(null);
     try {
       const data = await apiJson(`/api/music/jobs/${job.id}/search`, {
         method: 'POST',
@@ -171,6 +177,8 @@ export default function MusicReader({ shortJobId = null, shortClips = [] }) {
     if (!candidate || previewing) return;
     setError('');
     setSelected(candidate);
+    setExcerptResult(null);
+    setJoinResult(null);
     setPreviewing(true);
     try {
       const response = await apiFetch(
@@ -189,32 +197,86 @@ export default function MusicReader({ shortJobId = null, shortClips = [] }) {
     }
   };
 
-  const renderOverlay = async () => {
-    if (!selected || !shortJobId || !shortClips.length || rendering) return;
+  const exportExcerpt = async () => {
+    if (!selected || extracting) return;
     setError('');
-    setRendering(true);
-    setOverlayResult(null);
+    setExtracting(true);
+    setExcerptResult(null);
     try {
+      const data = await apiJson(`/api/music/jobs/${job.id}/excerpt`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          match_start: selected.start,
+          match_end: selected.end,
+          query: query.trim(),
+          matched_text: selected.matched_text,
+          match_score: selected.score,
+          excerpt_seconds: 10,
+          tail_padding: 0.15,
+        }),
+      });
+      setExcerptResult(data);
+    } catch (e) {
+      setError(errorText(e, 'Could not export the music excerpt.'));
+    } finally {
+      setExtracting(false);
+    }
+  };
+
+  const joinToVideo = async () => {
+    const existingReady = videoSource === 'openshort' && shortJobId && shortClips.length;
+    const uploadReady = videoSource === 'upload' && externalVideo && videoConfirmed;
+    if (!selected || (!existingReady && !uploadReady) || joining) return;
+    setError('');
+    setJoining(true);
+    setJoinResult(null);
+    let reservedUploadId = null;
+    try {
+      if (videoSource === 'upload') {
+        const slot = await apiJson('/api/uploads', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ filename: externalVideo.name }),
+        });
+        reservedUploadId = slot.upload_id;
+        const uploaded = await apiFetch(`/api/uploads/${slot.upload_id}`, {
+          method: 'PUT', body: externalVideo,
+        });
+        if (!uploaded.ok) {
+          const body = await uploaded.json().catch(() => ({}));
+          throw new Error(body.detail || 'Video upload failed.');
+        }
+      }
       const data = await apiJson('/api/music/overlay', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           music_job_id: job.id,
-          video_job_id: shortJobId,
+          video_source: videoSource,
+          video_job_id: videoSource === 'openshort' ? shortJobId : null,
           clip_index: Number(clipIndex),
+          video_upload_id: reservedUploadId,
+          video_acknowledged: videoSource === 'upload' ? videoConfirmed : false,
           start: selected.start,
           end: selected.end,
           query: query.trim(),
           matched_text: selected.matched_text,
           match_score: selected.score,
-          mode: overlayMode,
+          lead_seconds: 10,
+          tail_padding: 0.15,
+          lyric_captions: lyricCaptions,
         }),
       });
-      setOverlayResult(data);
+      setJoinResult(data);
+      reservedUploadId = null;
     } catch (e) {
-      setError(errorText(e, 'Could not render the Short.'));
+      if (reservedUploadId) {
+        apiFetch(`/api/uploads/${reservedUploadId}`, { method: 'DELETE' }).catch(() => {});
+      }
+      setError(errorText(e, 'Could not join the music excerpt to the video.'));
     } finally {
-      setRendering(false);
+      setJoining(false);
     }
   };
 
@@ -229,7 +291,13 @@ export default function MusicReader({ shortJobId = null, shortClips = [] }) {
     setSelected(null);
     setHasSearched(false);
     setPreviewUrl('');
-    setOverlayResult(null);
+    setExcerptResult(null);
+    setVideoSource('openshort');
+    setClipIndex(0);
+    setExternalVideo(null);
+    setVideoConfirmed(false);
+    setLyricCaptions(true);
+    setJoinResult(null);
     localStorage.setItem(ACTIVE_MUSIC_JOB_KEY, NEW_MUSIC_JOB);
     setError('');
   };
@@ -395,11 +463,63 @@ export default function MusicReader({ shortJobId = null, shortClips = [] }) {
             {job.status === 'completed' && selected && (
               <div className="card p-5 sm:p-6">
                 <div className="mb-4">
-                  <p className="eyebrow">ADD TO AN OPENSHORT</p>
-                  <p className="text-sm text-muted mt-2">The selected music starts at the beginning of the Short. The original MP4 is preserved.</p>
+                  <p className="eyebrow">EXPORT MUSIC EXCERPT</p>
+                  <p className="text-sm text-muted mt-2">Export a clean 10-second WAV that keeps the complete final matched word. You can join it to your clip manually.</p>
                 </div>
-                {shortJobId && shortClips.length ? (
-                  <div className="space-y-4">
+                <div className="space-y-4">
+                  <div className="rounded-input border border-rule bg-paper p-3">
+                    <span className="readout block">10-SECOND WAV · FINAL WORD PROTECTED</span>
+                    <span className="text-sm text-ink2 mt-2 block">
+                      approximately {timestamp(Math.max(0, selected.end + 0.15 - 10))} → {timestamp(selected.end + 0.15)}
+                    </span>
+                    <span className="text-xs text-muted mt-1 block">Ends 150 ms after “{selected.matched_text}” so the last sound is not cut off.</span>
+                  </div>
+                  <button
+                    onClick={exportExcerpt}
+                    disabled={extracting}
+                    className="btn-primary px-4 py-2.5 disabled:opacity-40"
+                  >
+                    {extracting ? <Loader2 size={15} className="animate-spin" /> : <Scissors size={15} />}
+                    {extracting ? 'exporting' : 'export 10-second WAV'}
+                  </button>
+                </div>
+
+                {excerptResult?.audio_url && (
+                  <div className="mt-5 border-t border-rule pt-5">
+                    <p className="eyebrow mb-3">EXCERPT READY</p>
+                    <audio controls src={getApiUrl(excerptResult.audio_url)} className="w-full" />
+                    <p className="text-xs text-muted mt-2">
+                      Exact range: {timestamp(excerptResult.plan.excerpt.start)} → {timestamp(excerptResult.plan.excerpt.end)} · {excerptResult.plan.excerpt.duration.toFixed(2)}s
+                    </p>
+                    <button onClick={() => download(excerptResult.audio_url, 'lyric-excerpt-10s.wav')} className="btn-quiet px-3 py-2 text-xs mt-3">
+                      <Download size={14} /> download WAV
+                    </button>
+                  </div>
+                )}
+
+                <div className="mt-6 border-t border-rule pt-5 space-y-4">
+                  <div>
+                    <p className="eyebrow">JOIN EXCERPT TO VIDEO</p>
+                    <p className="text-sm text-muted mt-2">Uses the same final-word-safe range shown above, then starts the selected video.</p>
+                  </div>
+                  <div className="grid sm:grid-cols-2 gap-2">
+                    {[
+                      ['openshort', 'Existing OpenShort', 'Use a clip from the current OpenShorts job.'],
+                      ['upload', 'Upload video manually', 'Use a video from outside OpenShorts.'],
+                    ].map(([value, label, description]) => (
+                      <button
+                        key={value}
+                        type="button"
+                        onClick={() => { setVideoSource(value); setJoinResult(null); setError(''); }}
+                        className={`text-left rounded-input border p-3 ${videoSource === value ? 'border-brass bg-paper2' : 'border-rule'}`}
+                      >
+                        <span className="text-sm text-ink block">{label}</span>
+                        <span className="text-xs text-muted mt-1 block">{description}</span>
+                      </button>
+                    ))}
+                  </div>
+
+                  {videoSource === 'openshort' && shortJobId && shortClips.length ? (
                     <label className="block">
                       <span className="readout block mb-2">TARGET SHORT</span>
                       <select value={clipIndex} onChange={(event) => setClipIndex(Number(event.target.value))} className="input-field w-full">
@@ -410,45 +530,87 @@ export default function MusicReader({ shortJobId = null, shortClips = [] }) {
                         ))}
                       </select>
                     </label>
-                    <div>
-                      <span className="readout block mb-2">AUDIO MODE</span>
-                      <div className="grid sm:grid-cols-2 gap-2">
-                        {[
-                          ['mix', 'Mix + duck', 'Keep the Short audio quietly under the lyric.'],
-                          ['replace', 'Replace intro', 'Use only the music during the selected phrase.'],
-                        ].map(([value, label, description]) => (
-                          <button
-                            key={value}
-                            type="button"
-                            onClick={() => setOverlayMode(value)}
-                            className={`text-left rounded-input border p-3 ${overlayMode === value ? 'border-brass bg-paper2' : 'border-rule'}`}
-                          >
-                            <span className="text-sm text-ink block">{label}</span>
-                            <span className="text-xs text-muted mt-1 block">{description}</span>
+                  ) : videoSource === 'openshort' ? (
+                    <p className="text-sm text-muted rounded-input border border-rule bg-paper p-4">
+                      No Short is loaded. Create or reopen an OpenShorts job, or choose manual upload.
+                    </p>
+                  ) : (
+                    <div className="space-y-3">
+                      <label className={`block border-2 border-dashed rounded-input p-5 text-center cursor-pointer transition-colors ${externalVideo ? 'border-brass' : 'border-rule2 hover:border-brass'}`}>
+                        <input
+                          type="file"
+                          accept="video/mp4,video/quicktime,video/webm,.mkv"
+                          className="hidden"
+                          onChange={(event) => { setExternalVideo(event.target.files?.[0] || null); setJoinResult(null); }}
+                        />
+                        {externalVideo ? (
+                          <span className="flex items-center justify-center gap-2 text-sm text-ink2 min-w-0">
+                            <Film size={16} className="text-brass shrink-0" />
+                            <span className="truncate">{externalVideo.name}</span>
+                          </span>
+                        ) : (
+                          <span className="text-sm text-muted">Choose an external MP4, MOV, WebM or MKV video</span>
+                        )}
+                      </label>
+                      <label className="flex items-start gap-3 text-sm text-muted cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={videoConfirmed}
+                          onChange={(event) => setVideoConfirmed(event.target.checked)}
+                          className="mt-0.5 accent-[var(--color-accent)]"
+                        />
+                        <span>I own this video or have permission to process it.</span>
+                      </label>
+                    </div>
+                  )}
+
+                  <label className="flex items-start gap-3 rounded-input border border-rule bg-paper p-3 text-sm text-muted cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={lyricCaptions}
+                      onChange={(event) => { setLyricCaptions(event.target.checked); setJoinResult(null); }}
+                      className="mt-0.5 accent-[var(--color-accent)]"
+                    />
+                    <span>
+                      <span className="text-ink2 block">Add lyric captions</span>
+                      <span className="text-xs block mt-1">OpenShorts karaoke style · white Anton · yellow active word · intro only</span>
+                    </span>
+                  </label>
+
+                  <button
+                    onClick={joinToVideo}
+                    disabled={joining || (videoSource === 'openshort' ? !(shortJobId && shortClips.length) : !(externalVideo && videoConfirmed))}
+                    className="btn-primary px-4 py-2.5 disabled:opacity-40"
+                  >
+                    {joining ? <Loader2 size={15} className="animate-spin" /> : <Sparkles size={15} />}
+                    {joining ? (videoSource === 'upload' ? 'uploading and joining' : 'joining') : 'join excerpt to video'}
+                  </button>
+
+                  {joinResult?.video_url && (
+                    <div className="border-t border-rule pt-5">
+                      <p className="eyebrow mb-3">VIDEO READY</p>
+                      <video controls src={getApiUrl(joinResult.video_url)} className="w-full max-h-[34rem] rounded-input bg-black" />
+                      <p className="text-xs text-muted mt-2">
+                        Music range: {timestamp(joinResult.plan.render.lead_start)} → {timestamp(joinResult.plan.render.lead_end)} · final word + {Math.round(joinResult.plan.render.tail_padding * 1000)} ms
+                      </p>
+                      <div className="flex flex-wrap gap-2 mt-3">
+                        <button onClick={() => download(joinResult.video_url, 'video-with-lyric-excerpt.mp4')} className="btn-quiet px-3 py-2 text-xs">
+                          <Download size={14} /> download MP4
+                        </button>
+                        {joinResult.plan.captions?.srt_url && (
+                          <button onClick={() => download(joinResult.plan.captions.srt_url, 'lyric-intro.srt')} className="btn-quiet px-3 py-2 text-xs">
+                            <Download size={14} /> SRT
                           </button>
-                        ))}
+                        )}
+                        {joinResult.plan.captions?.ass_url && (
+                          <button onClick={() => download(joinResult.plan.captions.ass_url, 'lyric-intro.ass')} className="btn-quiet px-3 py-2 text-xs">
+                            <Download size={14} /> ASS
+                          </button>
+                        )}
                       </div>
                     </div>
-                    <button onClick={renderOverlay} disabled={rendering} className="btn-primary px-4 py-2.5 disabled:opacity-40">
-                      {rendering ? <Loader2 size={15} className="animate-spin" /> : <Sparkles size={15} />}
-                      {rendering ? 'rendering' : 'render new Short'}
-                    </button>
-                  </div>
-                ) : (
-                  <p className="text-sm text-muted rounded-input border border-rule bg-paper p-4">
-                    No Short is loaded. Create or reopen an OpenShorts job, then return to Music Reader.
-                  </p>
-                )}
-
-                {overlayResult?.video_url && (
-                  <div className="mt-5 border-t border-rule pt-5">
-                    <p className="eyebrow mb-3">RENDER COMPLETE</p>
-                    <video controls src={getApiUrl(overlayResult.video_url)} className="w-full max-h-[34rem] rounded-input bg-black" />
-                    <button onClick={() => download(overlayResult.video_url, 'openshort-with-music.mp4')} className="btn-quiet px-3 py-2 text-xs mt-3">
-                      <Download size={14} /> download MP4
-                    </button>
-                  </div>
-                )}
+                  )}
+                </div>
               </div>
             )}
 
