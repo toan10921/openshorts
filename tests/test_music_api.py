@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 
 import httpx
@@ -120,6 +121,21 @@ def test_get_completed_job_adds_protected_artifact_urls(music_dirs):
     assert artifact.text == "Xin chào\n"
 
 
+def test_latest_music_job_restores_most_recent_record(music_dirs):
+    _, outputs, _ = music_dirs
+    for suffix, created in (("8", "2026-01-01T00:00:00Z"), ("9", "2026-02-01T00:00:00Z")):
+        job_id = "music_" + suffix * 32
+        output = outputs / job_id
+        output.mkdir()
+        app_module.music_jobs[job_id] = {
+            "status": "completed", "stage": "complete", "created_at": created,
+            "user_id": None, "output_dir": str(output), "result": {},
+        }
+    response = _request("GET", "/api/music/jobs/latest")
+    assert response.status_code == 200
+    assert response.json()["id"] == "music_" + "9" * 32
+
+
 def test_artifact_endpoint_does_not_serve_internal_files(music_dirs):
     _, outputs, _ = music_dirs
     job_id = "music_" + "b" * 32
@@ -167,3 +183,115 @@ def test_retry_reuses_original_upload(music_dirs):
     assert response.status_code == 200
     assert response.json()["status"] == "queued"
     assert scheduled == [job_id]
+
+
+def _completed_music(outputs, suffix="e"):
+    job_id = "music_" + suffix * 32
+    output = outputs / job_id
+    output.mkdir()
+    source = output / "source_upload.mp3"
+    source.write_bytes(b"audio")
+    (output / "source.json").write_text(
+        json.dumps({"duration": 120, "sha256": "abc123"}), encoding="utf-8",
+    )
+    app_module.music_jobs[job_id] = {
+        "status": "completed", "user_id": None, "output_dir": str(output),
+        "input_path": str(source), "result": {},
+    }
+    return job_id, output
+
+
+def test_search_music_lyrics_returns_ranked_timestamps(music_dirs):
+    _, outputs, _ = music_dirs
+    job_id, output = _completed_music(outputs)
+    (output / "transcript.json").write_text(json.dumps({
+        "segments": [{"words": [
+            {"word": "Xin", "start": 7.2, "end": 7.5},
+            {"word": "đừng", "start": 7.5, "end": 7.9},
+            {"word": "rời", "start": 7.9, "end": 8.2},
+            {"word": "xa", "start": 8.2, "end": 8.5},
+            {"word": "anh", "start": 8.5, "end": 8.9},
+        ]}],
+    }), encoding="utf-8")
+    response = _request(
+        "POST", f"/api/music/jobs/{job_id}/search",
+        json={"query": "xin dung roi xa anh", "top_k": 3},
+    )
+    assert response.status_code == 200, response.text
+    best = response.json()["candidates"][0]
+    assert best["start"] == 7.2
+    assert best["end"] == 8.9
+    assert best["score"] == 1.0
+
+
+def test_preview_uses_original_music_and_bounds_selection(music_dirs, monkeypatch):
+    _, outputs, _ = music_dirs
+    job_id, _ = _completed_music(outputs, "f")
+    seen = {}
+
+    def render(source, output, start, end):
+        seen.update(source=source, start=start, end=end)
+        with open(output, "wb") as target:
+            target.write(b"preview")
+
+    monkeypatch.setattr("music.compose.render_preview", render)
+    response = _request(
+        "GET", f"/api/music/jobs/{job_id}/preview?start=10&end=13&padding=.25",
+    )
+    assert response.status_code == 200, response.text
+    assert response.content == b"preview"
+    assert seen["source"].endswith("source_upload.mp3")
+    assert seen["start"] == 9.75
+    assert seen["end"] == 13.25
+
+    too_long = _request(
+        "GET", f"/api/music/jobs/{job_id}/preview?start=1&end=40&padding=0",
+    )
+    assert too_long.status_code == 400
+
+
+def test_overlay_creates_new_video_and_reproducible_plan(music_dirs, monkeypatch):
+    _, outputs, _ = music_dirs
+    music_job_id, _ = _completed_music(outputs, "1")
+    video_job_id = "video-job"
+    video_output = outputs / video_job_id
+    video_output.mkdir()
+    video = video_output / "clip.mp4"
+    video.write_bytes(b"video")
+    short_job = {
+        "status": "completed", "user_id": None,
+        "result": {"clips": [{
+            "video_url": f"/videos/{video_job_id}/clip.mp4",
+            "video_title_for_youtube_short": "Clip one",
+        }]},
+    }
+    monkeypatch.setattr(app_module, "_job_record", lambda value: short_job if value == video_job_id else None)
+
+    def render(video_path, music_path, output_path, *args):
+        assert video_path == str(video)
+        assert music_path.endswith("source_upload.mp3")
+        with open(output_path, "wb") as target:
+            target.write(b"rendered")
+        return {"video_duration": 30, "excerpt_duration": 3, "has_original_audio": True}
+
+    monkeypatch.setattr("music.compose.render_intro_overlay", render)
+    response = _request("POST", "/api/music/overlay", json={
+        "music_job_id": music_job_id,
+        "video_job_id": video_job_id,
+        "clip_index": 0,
+        "start": 10,
+        "end": 13,
+        "query": "xin đừng rời xa anh",
+        "matched_text": "Xin đừng rời xa anh",
+        "match_score": 0.95,
+        "mode": "mix",
+    })
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["video_url"].startswith(f"/videos/{video_job_id}/music_overlay_")
+    assert (video_output / os.path.basename(payload["video_url"])).read_bytes() == b"rendered"
+    plan = payload["plan"]
+    assert plan["music"]["start"] == 10
+    assert plan["video"]["source_file"] == "clip.mp4"
+    assert plan["mix"]["mode"] == "mix"
+    assert (video_output / os.path.basename(payload["plan_url"])).is_file()

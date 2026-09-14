@@ -6,6 +6,10 @@
   progress/manifest, ép ASR tiếng Việt, chuẩn hóa FFmpeg, xuất TXT/JSON/SRT,
   download ZIP, ownership/retention và tab Music Reader trên dashboard.
 - **Đã kiểm thử:** unit/API/regression backend và production build dashboard.
+- **Cầu nối Music → Short đã có code (2026-09-14):** tìm một câu lyric không
+  phụ thuộc dấu tiếng Việt, xếp hạng các timestamp gần đúng, nghe preview và
+  ghép đoạn nhạc được chọn vào đầu một output OpenShorts theo chế độ mix/duck
+  hoặc replace. File Short gốc không bị ghi đè; mỗi render có JSON plan.
 - **Còn lại trong M1:** benchmark transcription thật trên RTX 3060 bằng bộ file
   mẫu tiếng Việt và tinh chỉnh preset theo VRAM 6 GB hoặc 12 GB.
 - **Chưa triển khai:** Demucs/LRC/editor (M2), TTS (M3) và Video Continuity
@@ -189,6 +193,9 @@ Các endpoint cần xác thực/chủ sở hữu giống endpoint job hiện t�
 | --- | --- |
 | `POST /api/music/jobs` | Tạo job từ `upload_id`, options JSON |
 | `GET /api/music/jobs/{id}` | Poll trạng thái, progress và artifact URLs |
+| `POST /api/music/jobs/{id}/search` | Tìm các timestamp của một câu lyric, fuzzy match theo word timestamp |
+| `GET /api/music/jobs/{id}/preview` | Render audio preview tối đa 30 giây quanh candidate |
+| `POST /api/music/overlay` | Ghép candidate vào đầu một clip OpenShorts và lưu render plan |
 | `GET /api/music/jobs/{id}/lyrics` | Đọc lyric manifest |
 | `PUT /api/music/jobs/{id}/lyrics` | Lưu toàn bộ lyric đã sửa, validate version |
 | `POST /api/music/jobs/{id}/exports` | Tạo lại `txt`, `srt`, `lrc`, hoặc `tts` từ lyric hiện hành |
@@ -482,6 +489,8 @@ việc thiếu Demucs/Piper không làm hỏng Clip Generator hiện hữu.
   có thể hiểu được, không bỏ semaphore.
 - Manual GPU: RTX 3060 chạy 3 bài (giọng rõ, hòa âm dày, rap); ghi latency,
   VRAM peak và đánh giá lyric. Chỉ nâng model sau số liệu này.
+- Integration cầu nối: fuzzy search giữ timestamp word-level; preview đúng
+  range; FFmpeg mix/replace vẫn giữ nguyên duration và audio stream của Short.
 
 ### M4
 

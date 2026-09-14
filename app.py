@@ -2148,6 +2148,26 @@ class MusicJobRequest(BaseModel):
     create_tts: bool = False
 
 
+class MusicSearchRequest(BaseModel):
+    query: str
+    top_k: int = 5
+
+
+class MusicOverlayRequest(BaseModel):
+    music_job_id: str
+    video_job_id: str
+    clip_index: int
+    start: float
+    end: float
+    query: Optional[str] = None
+    matched_text: Optional[str] = None
+    match_score: Optional[float] = None
+    mode: str = "mix"
+    music_volume: float = 0.9
+    original_volume: float = 0.2
+    fade_seconds: float = 0.08
+
+
 def _music_job_dir(job_id):
     if not re.fullmatch(r"music_[0-9a-f]{32}", str(job_id or "")):
         return None
@@ -2232,6 +2252,24 @@ def _music_job_public_view(job_id, record):
         "error": record.get("error"),
         "created_at": record.get("created_at"),
     }
+
+
+def _music_source(record):
+    path = record.get("input_path") if record else None
+    if path and os.path.isfile(path):
+        return path
+    output_dir = (record or {}).get("output_dir")
+    matches = glob.glob(os.path.join(output_dir, "source_upload.*")) if output_dir else []
+    return matches[0] if matches else None
+
+
+def _music_source_metadata(record):
+    path = os.path.join((record or {}).get("output_dir") or "", "source.json")
+    try:
+        with open(path, encoding="utf-8") as source:
+            return json.load(source)
+    except (OSError, ValueError, TypeError):
+        return {}
 
 
 async def _run_music_job(job_id):
@@ -2342,6 +2380,23 @@ async def create_music_job(payload: MusicJobRequest, request: Request):
     return _music_job_public_view(job_id, record)
 
 
+@app.get("/api/music/jobs/latest")
+async def get_latest_music_job(request: Request):
+    """Restore the latest accessible Music Reader job after a dashboard reload."""
+    records = sorted(
+        music_jobs.items(),
+        key=lambda item: str((item[1] or {}).get("created_at") or ""),
+        reverse=True,
+    )
+    for job_id, record in records:
+        try:
+            await _assert_job_owner(request, record)
+        except HTTPException:
+            continue
+        return _music_job_public_view(job_id, record)
+    raise HTTPException(status_code=404, detail="No Music Reader job found")
+
+
 @app.get("/api/music/jobs/{job_id}")
 async def get_music_job(job_id: str, request: Request):
     record = music_jobs.get(job_id) or _music_job_from_disk(job_id)
@@ -2368,6 +2423,174 @@ async def retry_music_job(job_id: str, request: Request):
     _persist_music_job(job_id)
     _schedule_music_job(job_id)
     return _music_job_public_view(job_id, record)
+
+
+@app.post("/api/music/jobs/{job_id}/search")
+async def search_music_lyrics(job_id: str, payload: MusicSearchRequest, request: Request):
+    from music.search import search_transcript
+
+    record = music_jobs.get(job_id) or _music_job_from_disk(job_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Music job not found")
+    await _assert_job_owner(request, record)
+    transcript_path = os.path.join(record["output_dir"], "transcript.json")
+    try:
+        with open(transcript_path, encoding="utf-8") as source:
+            transcript = json.load(source)
+        candidates = search_transcript(transcript, payload.query, payload.top_k)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except (OSError, json.JSONDecodeError):
+        raise HTTPException(status_code=409, detail="Transcript is not available")
+    return {"query": payload.query, "candidates": candidates}
+
+
+@app.get("/api/music/jobs/{job_id}/preview")
+async def preview_music_selection(job_id: str, request: Request, start: float,
+                                  end: float, padding: float = 0.2):
+    from music.compose import render_preview
+
+    record = music_jobs.get(job_id) or _music_job_from_disk(job_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Music job not found")
+    await _assert_job_owner(request, record)
+    music_path = _music_source(record)
+    if not music_path:
+        raise HTTPException(status_code=409, detail="The original music file is no longer available")
+    try:
+        music_duration = float(_music_source_metadata(record).get("duration") or 0)
+    except (ValueError, TypeError):
+        music_duration = 0
+    padding = max(0.0, min(float(padding), 1.0))
+    start = max(0.0, float(start) - padding)
+    end = min(music_duration, float(end) + padding) if music_duration else float(end) + padding
+    if end <= start or end - start > 30:
+        raise HTTPException(status_code=400, detail="Preview must be between 0 and 30 seconds")
+    key = hashlib.sha256(f"{start:.3f}:{end:.3f}".encode()).hexdigest()[:16]
+    output_path = os.path.join(record["output_dir"], f"preview_{key}.mp3")
+    if not os.path.isfile(output_path):
+        try:
+            await asyncio.get_running_loop().run_in_executor(
+                None, functools.partial(render_preview, music_path, output_path, start, end))
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+    return FileResponse(output_path, media_type="audio/mpeg", filename="music-preview.mp3")
+
+
+def _short_clip_path(job_id, job, clip_index):
+    clips = ((job or {}).get("result") or {}).get("clips") or []
+    if clip_index < 0 or clip_index >= len(clips):
+        return None, None
+    clip = clips[clip_index]
+    filename = os.path.basename(str(clip.get("video_url") or ""))
+    if not filename:
+        return None, clip
+    root = os.path.realpath(os.path.join(OUTPUT_DIR, job_id))
+    path = os.path.realpath(os.path.join(root, filename))
+    if os.path.dirname(path) != root or not os.path.isfile(path):
+        return None, clip
+    return path, clip
+
+
+@app.post("/api/music/overlay")
+async def overlay_music_on_short(payload: MusicOverlayRequest, request: Request):
+    from music.compose import render_intro_overlay
+    from music.storage import atomic_write_json
+
+    music_record = music_jobs.get(payload.music_job_id) or _music_job_from_disk(payload.music_job_id)
+    if not music_record:
+        raise HTTPException(status_code=404, detail="Music job not found")
+    await _assert_job_owner(request, music_record)
+    short_job = _job_record(payload.video_job_id)
+    if not short_job:
+        raise HTTPException(status_code=404, detail="OpenShorts job not found")
+    await _assert_job_owner(request, short_job)
+    if short_job.get("status") != "completed":
+        raise HTTPException(status_code=409, detail="OpenShorts job is not completed")
+
+    if payload.mode not in {"mix", "replace"}:
+        raise HTTPException(status_code=400, detail="mode must be mix or replace")
+    numeric_values = [payload.start, payload.end, payload.original_volume,
+                      payload.music_volume, payload.fade_seconds]
+    if not all(math.isfinite(value) for value in numeric_values):
+        raise HTTPException(status_code=400, detail="Audio settings must be finite numbers")
+    if not 0 <= payload.original_volume <= 1 or not 0 <= payload.music_volume <= 2:
+        raise HTTPException(status_code=400, detail="Invalid audio volume")
+    if not 0 <= payload.fade_seconds <= 1:
+        raise HTTPException(status_code=400, detail="Invalid fade duration")
+    if payload.start < 0 or payload.end <= payload.start or payload.end - payload.start > 30:
+        raise HTTPException(status_code=400, detail="Music selection must be between 0 and 30 seconds")
+
+    music_metadata = _music_source_metadata(music_record)
+    try:
+        music_duration = float(music_metadata.get("duration") or 0)
+    except (TypeError, ValueError):
+        music_duration = 0
+    if music_duration <= 0:
+        raise HTTPException(status_code=409, detail="Music source metadata is not available")
+    if music_duration < payload.end:
+        raise HTTPException(status_code=400, detail="Music selection exceeds the source duration")
+    if payload.match_score is not None and not math.isfinite(payload.match_score):
+        raise HTTPException(status_code=400, detail="Match score must be a finite number")
+
+    music_path = _music_source(music_record)
+    video_path, clip = _short_clip_path(payload.video_job_id, short_job, payload.clip_index)
+    if not music_path:
+        raise HTTPException(status_code=409, detail="The original music file is no longer available")
+    if not video_path:
+        raise HTTPException(status_code=409, detail="The selected Short is no longer available")
+
+    token = uuid.uuid4().hex[:12]
+    output_dir = os.path.join(OUTPUT_DIR, payload.video_job_id)
+    output_filename = f"music_overlay_{token}_{os.path.basename(video_path)}"
+    output_path = os.path.join(output_dir, output_filename)
+    try:
+        details = await asyncio.get_running_loop().run_in_executor(
+            None,
+            functools.partial(
+                render_intro_overlay,
+                video_path, music_path, output_path,
+                payload.start, payload.end, payload.mode,
+                payload.music_volume, payload.original_volume, payload.fade_seconds,
+            ),
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    plan = {
+        "version": 1,
+        "music": {
+            "job_id": payload.music_job_id,
+            "source_sha256": music_metadata.get("sha256"),
+            "query": payload.query,
+            "matched_text": payload.matched_text,
+            "match_score": payload.match_score,
+            "start": payload.start,
+            "end": payload.end,
+        },
+        "video": {
+            "job_id": payload.video_job_id,
+            "clip_index": payload.clip_index,
+            "source_file": os.path.basename(video_path),
+            "title": (clip or {}).get("video_title_for_youtube_short"),
+        },
+        "mix": {
+            "mode": payload.mode,
+            "music_volume": payload.music_volume,
+            "original_volume": payload.original_volume,
+            "fade_seconds": payload.fade_seconds,
+        },
+        "render": details,
+        "output": output_filename,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    plan_filename = f"music_overlay_{token}.json"
+    atomic_write_json(os.path.join(output_dir, plan_filename), plan)
+    return {
+        "video_url": f"/videos/{payload.video_job_id}/{output_filename}",
+        "plan_url": f"/videos/{payload.video_job_id}/{plan_filename}",
+        "plan": plan,
+    }
 
 
 @app.get("/api/music/jobs/{job_id}/artifacts/{name}")

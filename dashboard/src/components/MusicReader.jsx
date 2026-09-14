@@ -1,21 +1,64 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Download, FileAudio, Loader2, Music2, RotateCcw, Upload, X } from 'lucide-react';
+import { Download, FileAudio, Loader2, Music2, Play, RotateCcw, Search, Sparkles, Upload, X } from 'lucide-react';
 import { apiFetch, apiJson } from '../lib/api';
+import { getApiUrl } from '../config';
 
 const TERMINAL = new Set(['completed', 'failed']);
+const ACTIVE_MUSIC_JOB_KEY = 'openshorts_music_job_id';
+const NEW_MUSIC_JOB = '__new__';
 
 const errorText = (error, fallback) => error?.detail || error?.message || fallback;
 
-export default function MusicReader() {
+const timestamp = (seconds) => {
+  const value = Math.max(0, Number(seconds) || 0);
+  const minutes = Math.floor(value / 60);
+  return `${minutes}:${String(Math.floor(value % 60)).padStart(2, '0')}.${String(Math.round((value % 1) * 10) % 10)}`;
+};
+
+export default function MusicReader({ shortJobId = null, shortClips = [] }) {
   const [file, setFile] = useState(null);
   const [confirmed, setConfirmed] = useState(false);
   const [job, setJob] = useState(null);
   const [lyrics, setLyrics] = useState(null);
   const [error, setError] = useState('');
   const [uploadProgress, setUploadProgress] = useState(false);
+  const [query, setQuery] = useState('');
+  const [candidates, setCandidates] = useState([]);
+  const [selected, setSelected] = useState(null);
+  const [searching, setSearching] = useState(false);
+  const [hasSearched, setHasSearched] = useState(false);
+  const [previewUrl, setPreviewUrl] = useState('');
+  const [previewing, setPreviewing] = useState(false);
+  const [clipIndex, setClipIndex] = useState(0);
+  const [overlayMode, setOverlayMode] = useState('mix');
+  const [rendering, setRendering] = useState(false);
+  const [overlayResult, setOverlayResult] = useState(null);
   const pollTimer = useRef(null);
 
   useEffect(() => () => clearTimeout(pollTimer.current), []);
+  useEffect(() => () => {
+    if (previewUrl) URL.revokeObjectURL(previewUrl);
+  }, [previewUrl]);
+
+  useEffect(() => {
+    if (clipIndex >= shortClips.length) setClipIndex(0);
+  }, [clipIndex, shortClips.length]);
+
+  useEffect(() => {
+    const savedJobId = localStorage.getItem(ACTIVE_MUSIC_JOB_KEY);
+    if (savedJobId === NEW_MUSIC_JOB) return;
+    const path = savedJobId
+      ? `/api/music/jobs/${savedJobId}`
+      : '/api/music/jobs/latest';
+    apiJson(path)
+      .then((restored) => {
+        setJob(restored);
+        localStorage.setItem(ACTIVE_MUSIC_JOB_KEY, restored.id);
+      })
+      .catch(() => {
+        if (savedJobId) localStorage.removeItem(ACTIVE_MUSIC_JOB_KEY);
+      });
+  }, []);
 
   useEffect(() => {
     if (!job?.id || TERMINAL.has(job.status)) return undefined;
@@ -70,6 +113,7 @@ export default function MusicReader() {
         body: JSON.stringify({ upload_id: slot.upload_id, language: 'vi' }),
       });
       setJob(created);
+      localStorage.setItem(ACTIVE_MUSIC_JOB_KEY, created.id);
       reservedUploadId = null; // consumed by POST /api/music/jobs
     } catch (e) {
       if (reservedUploadId) {
@@ -98,12 +142,95 @@ export default function MusicReader() {
     }
   };
 
+  const searchLyrics = async (event) => {
+    event?.preventDefault();
+    if (!job?.id || !query.trim() || searching) return;
+    setError('');
+    setSearching(true);
+    setSelected(null);
+    setCandidates([]);
+    setHasSearched(false);
+    setOverlayResult(null);
+    try {
+      const data = await apiJson(`/api/music/jobs/${job.id}/search`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query: query.trim(), top_k: 5 }),
+      });
+      setCandidates(data.candidates || []);
+      if ((data.candidates || []).length) setSelected(data.candidates[0]);
+      setHasSearched(true);
+    } catch (e) {
+      setError(errorText(e, 'Could not search the transcript.'));
+    } finally {
+      setSearching(false);
+    }
+  };
+
+  const preview = async (candidate) => {
+    if (!candidate || previewing) return;
+    setError('');
+    setSelected(candidate);
+    setPreviewing(true);
+    try {
+      const response = await apiFetch(
+        `/api/music/jobs/${job.id}/preview?start=${candidate.start}&end=${candidate.end}&padding=0.25`,
+      );
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.detail || 'Could not create preview.');
+      }
+      const nextUrl = URL.createObjectURL(await response.blob());
+      setPreviewUrl(nextUrl);
+    } catch (e) {
+      setError(errorText(e, 'Could not create preview.'));
+    } finally {
+      setPreviewing(false);
+    }
+  };
+
+  const renderOverlay = async () => {
+    if (!selected || !shortJobId || !shortClips.length || rendering) return;
+    setError('');
+    setRendering(true);
+    setOverlayResult(null);
+    try {
+      const data = await apiJson('/api/music/overlay', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          music_job_id: job.id,
+          video_job_id: shortJobId,
+          clip_index: Number(clipIndex),
+          start: selected.start,
+          end: selected.end,
+          query: query.trim(),
+          matched_text: selected.matched_text,
+          match_score: selected.score,
+          mode: overlayMode,
+        }),
+      });
+      setOverlayResult(data);
+    } catch (e) {
+      setError(errorText(e, 'Could not render the Short.'));
+    } finally {
+      setRendering(false);
+    }
+  };
+
   const reset = () => {
     clearTimeout(pollTimer.current);
     setFile(null);
     setConfirmed(false);
     setJob(null);
     setLyrics(null);
+    setQuery('');
+    setCandidates([]);
+    setSelected(null);
+    setHasSearched(false);
+    setPreviewUrl('');
+    setOverlayResult(null);
+    localStorage.setItem(ACTIVE_MUSIC_JOB_KEY, NEW_MUSIC_JOB);
     setError('');
   };
 
@@ -210,6 +337,118 @@ export default function MusicReader() {
                     </button>
                   ))}
                 </div>
+              </div>
+            )}
+
+            {job.status === 'completed' && (
+              <div className="card p-5 sm:p-6">
+                <div className="mb-4">
+                  <p className="eyebrow">FIND A LYRIC MOMENT</p>
+                  <p className="text-sm text-muted mt-2">Enter one lyric sentence. Matching ignores accents and tolerates transcription mistakes.</p>
+                </div>
+                <form onSubmit={searchLyrics} className="flex flex-col sm:flex-row gap-2">
+                  <input
+                    value={query}
+                    onChange={(event) => {
+                      setQuery(event.target.value);
+                      setCandidates([]);
+                      setSelected(null);
+                      setHasSearched(false);
+                    }}
+                    placeholder="hạnh phúc anh xây sao em lại phủi tay"
+                    className="input-field flex-1 min-w-0"
+                  />
+                  <button disabled={!query.trim() || searching} className="btn-primary px-4 py-2.5 disabled:opacity-40">
+                    {searching ? <Loader2 size={15} className="animate-spin" /> : <Search size={15} />}
+                    find timestamp
+                  </button>
+                </form>
+
+                {!!candidates.length && (
+                  <div className="mt-4 space-y-2">
+                    {candidates.map((candidate, index) => (
+                      <button
+                        key={`${candidate.start}-${candidate.end}`}
+                        type="button"
+                        onClick={() => preview(candidate)}
+                        className={`w-full text-left rounded-input border p-3 transition-colors ${selected === candidate ? 'border-brass bg-paper2' : 'border-rule hover:border-rule2'}`}
+                      >
+                        <span className="flex items-center justify-between gap-3">
+                          <span className="font-mono text-xs text-brass tabular-nums">{timestamp(candidate.start)} → {timestamp(candidate.end)}</span>
+                          <span className="readout">{Math.round(candidate.score * 100)}% MATCH {index === 0 ? '· BEST' : ''}</span>
+                        </span>
+                        <span className="flex items-start gap-2 mt-2 text-sm text-ink2">
+                          <Play size={13} className="mt-0.5 shrink-0" /> {candidate.matched_text}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+                {!searching && hasSearched && candidates.length === 0 && (
+                  <p className="text-sm text-muted mt-4">No close match found. Try a longer phrase or a spelling variant.</p>
+                )}
+                {previewing && <p className="readout mt-3">CREATING PREVIEW…</p>}
+                {previewUrl && <audio key={previewUrl} controls autoPlay src={previewUrl} className="w-full mt-4" />}
+              </div>
+            )}
+
+            {job.status === 'completed' && selected && (
+              <div className="card p-5 sm:p-6">
+                <div className="mb-4">
+                  <p className="eyebrow">ADD TO AN OPENSHORT</p>
+                  <p className="text-sm text-muted mt-2">The selected music starts at the beginning of the Short. The original MP4 is preserved.</p>
+                </div>
+                {shortJobId && shortClips.length ? (
+                  <div className="space-y-4">
+                    <label className="block">
+                      <span className="readout block mb-2">TARGET SHORT</span>
+                      <select value={clipIndex} onChange={(event) => setClipIndex(Number(event.target.value))} className="input-field w-full">
+                        {shortClips.map((clip, index) => (
+                          <option key={`${index}-${clip.video_url || ''}`} value={index}>
+                            Short {index + 1} — {clip.video_title_for_youtube_short || clip.hook || 'Untitled clip'}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <div>
+                      <span className="readout block mb-2">AUDIO MODE</span>
+                      <div className="grid sm:grid-cols-2 gap-2">
+                        {[
+                          ['mix', 'Mix + duck', 'Keep the Short audio quietly under the lyric.'],
+                          ['replace', 'Replace intro', 'Use only the music during the selected phrase.'],
+                        ].map(([value, label, description]) => (
+                          <button
+                            key={value}
+                            type="button"
+                            onClick={() => setOverlayMode(value)}
+                            className={`text-left rounded-input border p-3 ${overlayMode === value ? 'border-brass bg-paper2' : 'border-rule'}`}
+                          >
+                            <span className="text-sm text-ink block">{label}</span>
+                            <span className="text-xs text-muted mt-1 block">{description}</span>
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    <button onClick={renderOverlay} disabled={rendering} className="btn-primary px-4 py-2.5 disabled:opacity-40">
+                      {rendering ? <Loader2 size={15} className="animate-spin" /> : <Sparkles size={15} />}
+                      {rendering ? 'rendering' : 'render new Short'}
+                    </button>
+                  </div>
+                ) : (
+                  <p className="text-sm text-muted rounded-input border border-rule bg-paper p-4">
+                    No Short is loaded. Create or reopen an OpenShorts job, then return to Music Reader.
+                  </p>
+                )}
+
+                {overlayResult?.video_url && (
+                  <div className="mt-5 border-t border-rule pt-5">
+                    <p className="eyebrow mb-3">RENDER COMPLETE</p>
+                    <video controls src={getApiUrl(overlayResult.video_url)} className="w-full max-h-[34rem] rounded-input bg-black" />
+                    <button onClick={() => download(overlayResult.video_url, 'openshort-with-music.mp4')} className="btn-quiet px-3 py-2 text-xs mt-3">
+                      <Download size={14} /> download MP4
+                    </button>
+                  </div>
+                )}
               </div>
             )}
 

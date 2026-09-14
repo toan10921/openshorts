@@ -1701,7 +1701,9 @@ function App() {
             />
           )}
 
-          {activeTab === 'music' && <MusicReader />}
+          {activeTab === 'music' && (
+            <MusicReader shortJobId={jobId} shortClips={results?.clips || []} />
+          )}
 
           {/* View: Gallery */}
           {/* {activeTab === 'gallery' && (
