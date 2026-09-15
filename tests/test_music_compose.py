@@ -127,6 +127,18 @@ def test_join_burns_ass_captions_on_intro(sample_media, tmp_path):
     assert media_duration(output) == pytest.approx(6.0, abs=0.15)
 
 
+def test_join_uses_looped_stock_video_for_intro(sample_media, tmp_path):
+    video, music = sample_media
+    output = tmp_path / "joined-stock.mp4"
+    details = render_music_excerpt_join(
+        video, music, output, match_end=4.0, source_duration=5.0,
+        excerpt_seconds=3.0, tail_padding=0.0, intro_visual_path=video,
+    )
+    assert output.is_file()
+    assert media_duration(output) == pytest.approx(6.0, abs=0.15)
+    assert details["intro_visual"] == "stock"
+
+
 def test_media_stream_detection_distinguishes_video_and_audio(sample_media):
     video, music = sample_media
     assert media_has_video(video)

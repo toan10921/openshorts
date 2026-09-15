@@ -16,6 +16,9 @@
 - **Caption phần nhạc đã có code:** mặc định burn karaoke caption theo preset
   OpenShorts chỉ trong đoạn intro; word timestamp được rebase về 0. Render plan
   giữ danh sách word và URL tải ASS/SRT để tiếp tục chỉnh sửa bên ngoài.
+- **Timelapse hook visual đã có code:** Pexels portrait search + local query
+  cache, crop/loop đúng duration hook, bỏ audio stock và giữ nguyên sound hook.
+  Query cấu hình được trên UI; lỗi API/download tự fallback về frame đầu clip.
 - **Còn lại trong M1:** benchmark transcription thật trên RTX 3060 bằng bộ file
   mẫu tiếng Việt và tinh chỉnh preset theo VRAM 6 GB hoặc 12 GB.
 - **Chưa triển khai:** Demucs/LRC/editor (M2), TTS (M3) và Video Continuity

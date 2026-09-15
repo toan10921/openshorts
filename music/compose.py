@@ -44,6 +44,16 @@ def media_duration(path):
     return float((json.loads(result.stdout).get("format") or {}).get("duration") or 0)
 
 
+def media_video_size(path):
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height", "-of", "json", str(path)],
+        check=True, capture_output=True, text=True, timeout=60,
+    )
+    stream = (json.loads(result.stdout).get("streams") or [{}])[0]
+    return int(stream.get("width") or 0), int(stream.get("height") or 0)
+
+
 def render_preview(source, output, start, end, fade=0.08):
     duration = end - start
     fade = max(0.0, min(float(fade), duration / 3))
@@ -84,13 +94,17 @@ def render_lyric_excerpt(source, output, match_end, source_duration,
 
 def render_music_excerpt_join(video, music, output, match_end, source_duration,
                               excerpt_seconds=10.0, tail_padding=0.15,
-                              music_volume=0.9, fade=0.08, subtitle_path=None):
+                              music_volume=0.9, fade=0.08, subtitle_path=None,
+                              intro_visual_path=None):
     """Prepend the same final-word-safe excerpt exported by the WAV action."""
     video_duration = media_duration(video)
     excerpt_start, protected_end, intro_duration = _lyric_excerpt_bounds(
         match_end, source_duration, excerpt_seconds, tail_padding)
     if video_duration <= 0 or intro_duration <= 0:
         raise MusicComposeError("Khoảng nhạc hoặc video không hợp lệ")
+    video_width, video_height = media_video_size(video)
+    if video_width <= 0 or video_height <= 0:
+        raise MusicComposeError("Không đọc được kích thước video")
 
     fade = max(0.0, min(float(fade), intro_duration / 3))
     audio_format = "aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo"
@@ -101,13 +115,21 @@ def render_music_excerpt_join(video, music, output, match_end, source_duration,
         fonts_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "fonts")
         safe_fonts = escape_filter_value(fonts_dir)
         caption_filter = f",ass=filename='{safe_subtitle}':fontsdir='{safe_fonts}'"
-    intro_video = (
-        f"[0:v]trim=end_frame=1,setpts=PTS-STARTPTS,{video_format},"
-        f"tpad=stop_mode=clone:stop_duration={intro_duration:.3f},"
-        f"trim=duration={intro_duration:.3f},setpts=PTS-STARTPTS"
-        f"{caption_filter}[introv]"
-    )
-    main_video = f"[0:v]setpts=PTS-STARTPTS,{video_format}[mainv]"
+    if intro_visual_path:
+        intro_video = (
+            f"[2:v]trim=duration={intro_duration:.3f},setpts=PTS-STARTPTS,"
+            f"scale={video_width}:{video_height}:force_original_aspect_ratio=increase,"
+            f"crop={video_width}:{video_height},setsar=1,{video_format}"
+            f"{caption_filter}[introv]"
+        )
+    else:
+        intro_video = (
+            f"[0:v]trim=end_frame=1,setpts=PTS-STARTPTS,{video_format},"
+            f"tpad=stop_mode=clone:stop_duration={intro_duration:.3f},"
+            f"trim=duration={intro_duration:.3f},setpts=PTS-STARTPTS,setsar=1"
+            f"{caption_filter}[introv]"
+        )
+    main_video = f"[0:v]setpts=PTS-STARTPTS,{video_format},setsar=1[mainv]"
     # Do not fade the end of the music: that is exactly where the protected
     # final word lives. A tiny fade-in only prevents a pop at the excerpt start.
     intro_audio = (
@@ -132,12 +154,17 @@ def render_music_excerpt_join(video, music, output, match_end, source_duration,
     command = [
         "ffmpeg", "-y", "-loglevel", "error", "-i", str(video),
         "-ss", f"{excerpt_start:.3f}", "-t", f"{intro_duration:.3f}",
-        "-i", str(music), "-filter_complex", graph,
+        "-i", str(music),
+    ]
+    if intro_visual_path:
+        command.extend(["-stream_loop", "-1", "-i", str(intro_visual_path)])
+    command.extend([
+        "-filter_complex", graph,
         "-map", "[outv]", "-map", "[outa]",
         "-c:v", "libx264", "-preset", "medium", "-crf", "18",
         "-c:a", "aac", "-b:a", "192k", "-t", f"{output_duration:.3f}",
         "-movflags", "+faststart", str(output),
-    ]
+    ])
     _run(command, "Không thể nối đoạn nhạc vào video")
     return {
         "video_duration": round(video_duration, 3),
@@ -148,6 +175,7 @@ def render_music_excerpt_join(video, music, output, match_end, source_duration,
         "tail_padding": round(protected_end - float(match_end), 3),
         "output_duration": round(output_duration, 3),
         "has_original_audio": has_audio,
+        "intro_visual": "stock" if intro_visual_path else "hold_frame",
     }
 
 

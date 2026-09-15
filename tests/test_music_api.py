@@ -316,8 +316,9 @@ def test_overlay_creates_new_video_and_reproducible_plan(music_dirs, monkeypatch
     def render(video_path, music_path, output_path, *args):
         assert video_path == str(video)
         assert music_path.endswith("source_upload.mp3")
-        assert args[-1].endswith(".ass")
-        assert os.path.isfile(args[-1])
+        assert args[-2].endswith(".ass")
+        assert os.path.isfile(args[-2])
+        assert args[-1] is None
         with open(output_path, "wb") as target:
             target.write(b"rendered")
         return {"video_duration": 30, "excerpt_duration": 3, "has_original_audio": True}
@@ -350,6 +351,8 @@ def test_overlay_creates_new_video_and_reproducible_plan(music_dirs, monkeypatch
     assert all(word["text"] != "Next" for word in plan["captions"]["words"])
     assert (video_output / os.path.basename(plan["captions"]["ass_url"])).is_file()
     assert (video_output / os.path.basename(plan["captions"]["srt_url"])).is_file()
+    assert plan["hook_visual"]["used"] == "hold_frame"
+    assert "PEXELS_API_KEY" in plan["hook_visual"]["fallback_reason"]
     assert (video_output / os.path.basename(payload["plan_url"])).is_file()
 
 

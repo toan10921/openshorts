@@ -36,6 +36,8 @@ export default function MusicReader({ shortJobId = null, shortClips = [] }) {
   const [externalVideo, setExternalVideo] = useState(null);
   const [videoConfirmed, setVideoConfirmed] = useState(false);
   const [lyricCaptions, setLyricCaptions] = useState(true);
+  const [hookVisual, setHookVisual] = useState('pexels');
+  const [visualQuery, setVisualQuery] = useState('city timelapse');
   const [joining, setJoining] = useState(false);
   const [joinResult, setJoinResult] = useState(null);
   const pollTimer = useRef(null);
@@ -266,6 +268,8 @@ export default function MusicReader({ shortJobId = null, shortClips = [] }) {
           lead_seconds: 10,
           tail_padding: 0.15,
           lyric_captions: lyricCaptions,
+          hook_visual: hookVisual,
+          visual_query: visualQuery.trim() || 'city timelapse',
         }),
       });
       setJoinResult(data);
@@ -297,6 +301,8 @@ export default function MusicReader({ shortJobId = null, shortClips = [] }) {
     setExternalVideo(null);
     setVideoConfirmed(false);
     setLyricCaptions(true);
+    setHookVisual('pexels');
+    setVisualQuery('city timelapse');
     setJoinResult(null);
     localStorage.setItem(ACTIVE_MUSIC_JOB_KEY, NEW_MUSIC_JOB);
     setError('');
@@ -564,6 +570,40 @@ export default function MusicReader({ shortJobId = null, shortClips = [] }) {
                     </div>
                   )}
 
+                  <div>
+                    <span className="readout block mb-2">HOOK VISUAL</span>
+                    <div className="grid sm:grid-cols-2 gap-2">
+                      {[
+                        ['pexels', 'Pexels timelapse', 'Search, cache and crop a portrait stock video.'],
+                        ['hold_frame', 'Hold first frame', 'Use the original static intro visual.'],
+                      ].map(([value, label, description]) => (
+                        <button
+                          key={value}
+                          type="button"
+                          onClick={() => { setHookVisual(value); setJoinResult(null); }}
+                          className={`text-left rounded-input border p-3 ${hookVisual === value ? 'border-brass bg-paper2' : 'border-rule'}`}
+                        >
+                          <span className="text-sm text-ink block">{label}</span>
+                          <span className="text-xs text-muted mt-1 block">{description}</span>
+                        </button>
+                      ))}
+                    </div>
+                    {hookVisual === 'pexels' && (
+                      <div className="mt-3">
+                        <input
+                          value={visualQuery}
+                          maxLength={120}
+                          onChange={(event) => { setVisualQuery(event.target.value); setJoinResult(null); }}
+                          placeholder="city timelapse"
+                          className="input-field w-full"
+                        />
+                        <a href="https://www.pexels.com" target="_blank" rel="noopener noreferrer" className="text-xs text-brass hover:underline mt-2 inline-block">
+                          Videos provided by Pexels
+                        </a>
+                      </div>
+                    )}
+                  </div>
+
                   <label className="flex items-start gap-3 rounded-input border border-rule bg-paper p-3 text-sm text-muted cursor-pointer">
                     <input
                       type="checkbox"
@@ -593,6 +633,21 @@ export default function MusicReader({ shortJobId = null, shortClips = [] }) {
                       <p className="text-xs text-muted mt-2">
                         Music range: {timestamp(joinResult.plan.render.lead_start)} → {timestamp(joinResult.plan.render.lead_end)} · final word + {Math.round(joinResult.plan.render.tail_padding * 1000)} ms
                       </p>
+                      {joinResult.plan.hook_visual?.used === 'pexels' && (
+                        <a
+                          href={joinResult.plan.hook_visual.provider?.page_url || 'https://www.pexels.com'}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-xs text-brass hover:underline mt-2 inline-block"
+                        >
+                          Video by {joinResult.plan.hook_visual.provider?.author || 'a Pexels creator'} on Pexels
+                        </a>
+                      )}
+                      {joinResult.plan.hook_visual?.fallback_reason && (
+                        <p className="badge-warn normal-case px-3 py-2 rounded-input mt-3 text-xs">
+                          Pexels unavailable; used the first video frame. {joinResult.plan.hook_visual.fallback_reason}
+                        </p>
+                      )}
                       <div className="flex flex-wrap gap-2 mt-3">
                         <button onClick={() => download(joinResult.video_url, 'video-with-lyric-excerpt.mp4')} className="btn-quiet px-3 py-2 text-xs">
                           <Download size={14} /> download MP4

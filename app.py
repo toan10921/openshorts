@@ -39,6 +39,9 @@ UPLOAD_DIR = "uploads"
 OUTPUT_DIR = "output"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+STOCK_CACHE_DIR = os.environ.get("STOCK_CACHE_DIR", os.path.join(OUTPUT_DIR, "_stock_cache"))
+PEXELS_CACHE_DIR = os.path.join(STOCK_CACHE_DIR, "pexels")
+PEXELS_DEFAULT_QUERY = os.environ.get("HOOK_VISUAL_QUERY", "city timelapse")
 
 # Configuration
 # Default to 1 if not set, but user can set higher for powerful servers
@@ -1072,7 +1075,7 @@ async def cleanup_jobs():
             for job_id in os.listdir(OUTPUT_DIR):
                 # Not a job: the thumbnails dir backs a StaticFiles mount, so
                 # deleting it would 500 every /thumbnails request until reboot.
-                if job_id == os.path.basename(THUMBNAILS_DIR):
+                if job_id in {os.path.basename(THUMBNAILS_DIR), os.path.basename(STOCK_CACHE_DIR)}:
                     continue
                 job_path = os.path.join(OUTPUT_DIR, job_id)
                 if os.path.isdir(job_path):
@@ -2182,6 +2185,8 @@ class MusicOverlayRequest(BaseModel):
     lead_seconds: float = 10.0
     tail_padding: float = 0.15
     lyric_captions: bool = True
+    hook_visual: str = "pexels"
+    visual_query: str = "city timelapse"
 
 
 def _music_job_dir(job_id):
@@ -2591,6 +2596,11 @@ async def overlay_music_on_short(payload: MusicOverlayRequest, request: Request)
     await _assert_job_owner(request, music_record)
     if payload.video_source not in {"openshort", "upload"}:
         raise HTTPException(status_code=400, detail="video_source must be openshort or upload")
+    if payload.hook_visual not in {"pexels", "hold_frame"}:
+        raise HTTPException(status_code=400, detail="hook_visual must be pexels or hold_frame")
+    visual_query = " ".join(str(payload.visual_query or PEXELS_DEFAULT_QUERY).split())
+    if not visual_query or len(visual_query) > 120:
+        raise HTTPException(status_code=400, detail="visual_query must be between 1 and 120 characters")
 
     numeric_values = [payload.start, payload.end, payload.original_volume,
                       payload.music_volume, payload.fade_seconds, payload.lead_seconds,
@@ -2725,6 +2735,36 @@ async def overlay_music_on_short(payload: MusicOverlayRequest, request: Request)
             "ass_url": f"/videos/{output_job_id}/{ass_filename}" if made_ass else None,
             "srt_url": f"/videos/{output_job_id}/{srt_filename}" if made_srt else None,
         }
+
+    intro_visual_path = None
+    visual_plan = {
+        "requested": payload.hook_visual,
+        "used": "hold_frame",
+        "query": visual_query,
+        "fallback_reason": None,
+        "provider": None,
+    }
+    if payload.hook_visual == "pexels":
+        from stock_media.pexels import get_pexels_timelapse
+
+        try:
+            intro_visual_path, pexels_metadata = await asyncio.get_running_loop().run_in_executor(
+                None,
+                functools.partial(
+                    get_pexels_timelapse,
+                    os.environ.get("PEXELS_API_KEY"), visual_query, payload.lead_seconds,
+                    PEXELS_CACHE_DIR,
+                    float(os.environ.get("HOOK_VISUAL_CACHE_DAYS", "7")),
+                    float(os.environ.get("HOOK_VISUAL_CACHE_MAX_GB", "5")),
+                    float(os.environ.get("PEXELS_TIMEOUT_SECONDS", "30")),
+                ),
+            )
+            if not media_has_video(intro_visual_path):
+                raise ValueError("Cached Pexels asset has no video stream")
+            visual_plan.update(used="pexels", provider=pexels_metadata)
+        except Exception as exc:
+            intro_visual_path = None
+            visual_plan["fallback_reason"] = str(exc) or type(exc).__name__
     try:
         details = await asyncio.get_running_loop().run_in_executor(
             None,
@@ -2733,7 +2773,7 @@ async def overlay_music_on_short(payload: MusicOverlayRequest, request: Request)
                 video_path, music_path, output_path,
                 payload.end, music_duration, payload.lead_seconds,
                 payload.tail_padding, payload.music_volume, payload.fade_seconds,
-                subtitle_path,
+                subtitle_path, intro_visual_path,
             ),
         )
     except Exception as exc:
@@ -2759,6 +2799,7 @@ async def overlay_music_on_short(payload: MusicOverlayRequest, request: Request)
             "fade_seconds": payload.fade_seconds,
         },
         "captions": caption_plan,
+        "hook_visual": visual_plan,
         "render": details,
         "output": output_filename,
         "created_at": datetime.now(timezone.utc).isoformat(),
